@@ -24,7 +24,7 @@ class SendList(BaseModel):
     header: str
     body: str
     button_text: str
-    sections: list[dict]  # conforme doc da UAZAPI
+    sections: list[dict]
 
 def uaz_base(subdomain: str) -> str:
     return f"https://{subdomain}.uazapi.com"
