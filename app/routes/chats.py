@@ -32,9 +32,13 @@ async def find_chats(body: ChatFind, user=Depends(decode_jwt)):
         r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
-        return r.json()
+        data = r.json()
+        items = (
+            data.get("chats") or data.get("items") or data.get("data")
+            or data.get("result") or (data if isinstance(data, list) else [])
+        )
+        return {"items": items}
 
-# opcional: fallback GET
 @router.get("/chats")
 async def list_chats(user=Depends(decode_jwt)):
     sub = user["subdomain"]; tok = user["token"]
@@ -44,4 +48,9 @@ async def list_chats(user=Depends(decode_jwt)):
         r = await client.post(url, headers=uaz_headers(tok), json=payload)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
-        return r.json()
+        data = r.json()
+        items = (
+            data.get("chats") or data.get("items") or data.get("data")
+            or data.get("result") or (data if isinstance(data, list) else [])
+        )
+        return {"items": items}
