@@ -7,11 +7,6 @@ router = APIRouter()
 
 @router.get("/sse")
 async def sse(events: str = "chats,messages,messages_update", user=Depends(decode_jwt)):
-    """
-    Proxy SSE -> UAZAPI
-    Uso no front: new EventSource(`${BACK}/api/sse?events=messages`, { withCredentials:false })
-    (O JWT vai por header; aqui o back injeta o token da instância na query para a UAZAPI)
-    """
     sub = user["subdomain"]; tok = user["token"]
     base = f"https://{sub}.uazapi.com/sse?token={tok}&events={events}"
 
@@ -25,5 +20,4 @@ async def sse(events: str = "chats,messages,messages_update", user=Depends(decod
                     if line is None:
                         continue
                     yield (line + "\n")
-
     return StreamingResponse(generator(), media_type="text/event-stream")
