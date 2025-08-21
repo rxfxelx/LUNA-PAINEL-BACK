@@ -9,7 +9,7 @@ def get_allowed_origins():
     raw = os.getenv("FRONTEND_ORIGIN", "*").strip()
     if not raw or raw == "*":
         return ["*"]
-    # suporta lista separada por vírgula
+    # permite lista separada por vírgula
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 app = FastAPI(title="Luna Backend")
@@ -20,7 +20,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],   # opcional, mas útil
+    expose_headers=["*"],
 )
 
 @app.get("/api/health")
