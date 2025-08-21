@@ -25,9 +25,8 @@ app.add_middleware(
 def health():
     return {"ok": True, "origins": allowed_origins()}
 
-# Rotas
-app.include_router(auth_router,        prefix="/api/auth", tags=["auth"])
-app.include_router(chats.router,       prefix="/api",      tags=["chats"])
-app.include_router(messages.router,    prefix="/api",      tags=["messages"])
-app.include_router(send.router,        prefix="/api",      tags=["send"])
-app.include_router(realtime.router,    prefix="/api",      tags=["sse"])
+app.include_router(auth_router,     prefix="/api/auth", tags=["auth"])
+app.include_router(chats.router,    prefix="/api",      tags=["chats"])
+app.include_router(messages.router, prefix="/api",      tags=["messages"])
+app.include_router(send.router,     prefix="/api",      tags=["send"])
+app.include_router(realtime.router, prefix="/api",      tags=["sse"])
