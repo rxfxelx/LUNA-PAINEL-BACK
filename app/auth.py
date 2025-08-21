@@ -6,10 +6,10 @@ router = APIRouter()
 
 JWT_SECRET = os.getenv("LUNA_JWT_SECRET", "changeme")
 JWT_TTL    = int(os.getenv("LUNA_JWT_TTL", "86400"))  # segundos
-SUBDOMAIN_DEFAULT = os.getenv("SUBDOMAIN_DEFAULT", "hia-clientes")  # fixo no back
+SUBDOMAIN_DEFAULT = os.getenv("SUBDOMAIN_DEFAULT", "hia-clientes")  # fixo
 
 class LoginRequest(BaseModel):
-    token: str                  # instance token (vem do front, por usuário)
+    token: str                  # instance token (vem do front)
     label: str | None = None
     number_hint: str | None = None
 
@@ -17,7 +17,6 @@ class LoginRequest(BaseModel):
 def login(data: LoginRequest):
     if not data.token:
         raise HTTPException(400, "Instance token obrigatório")
-
     payload = {
         "subdomain": SUBDOMAIN_DEFAULT,
         "token": data.token,
