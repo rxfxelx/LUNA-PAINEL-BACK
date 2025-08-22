@@ -15,42 +15,27 @@ class ChatFind(BaseModel):
     wa_contactName: str | None = None
     name: str | None = None
 
-def uaz_base(subdomain: str) -> str:
-    return f"https://{subdomain}.uazapi.com"
-
-def uaz_headers(token: str) -> dict:
-    return {"token": token, "Content-Type": "application/json"}
-
-def to_dict(model: BaseModel) -> dict:
-    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+def base(host: str) -> str: return f"https://{host}"
+def hdr(tok: str) -> dict:  return {"token": tok, "Content-Type": "application/json"}
+def to_dict(m: BaseModel) -> dict: return m.model_dump() if hasattr(m, "model_dump") else m.dict()
 
 @router.post("/chats")
 async def find_chats(body: ChatFind, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/chat/find"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/chat/find"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         data = r.json()
-        items = (
-            data.get("chats") or data.get("items") or data.get("data")
-            or data.get("result") or (data if isinstance(data, list) else [])
-        )
+        items = data.get("chats") or data.get("items") or data.get("data") or data.get("result") \
+                or (data if isinstance(data, list) else [])
         return {"items": items}
 
-@router.get("/chats")
-async def list_chats(user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/chat/find"
-    payload = {"operator": "AND", "sort": "-wa_lastMsgTimestamp", "limit": 50, "offset": 0}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
-        data = r.json()
-        items = (
-            data.get("chats") or data.get("items") or data.get("data")
-            or data.get("result") or (data if isinstance(data, list) else [])
-        )
-        return {"items": items}
+@router.get("/chats/count")
+async def chats_count(user=Depends(decode_jwt)):
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/chat/count"
+    async with httpx.AsyncClient(timeout=15.0) as c:
+        r = await c.get(url, headers={"token": tok})
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
+        return r.json()
