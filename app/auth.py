@@ -4,12 +4,12 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-JWT_SECRET = os.getenv("LUNA_JWT_SECRET", "changeme")
-JWT_TTL    = int(os.getenv("LUNA_JWT_TTL", "86400"))  # segundos
-SUBDOMAIN_DEFAULT = os.getenv("SUBDOMAIN_DEFAULT", "hia-clientes")  # fixo
+JWT_SECRET  = os.getenv("LUNA_JWT_SECRET", "changeme")
+JWT_TTL     = int(os.getenv("LUNA_JWT_TTL", "86400"))
+UAZAPI_HOST = os.getenv("UAZAPI_HOST", "hia-clientes.uazapi.com")  # FIXO
 
 class LoginRequest(BaseModel):
-    token: str                  # instance token (vem do front)
+    token: str
     label: str | None = None
     number_hint: str | None = None
 
@@ -18,7 +18,7 @@ def login(data: LoginRequest):
     if not data.token:
         raise HTTPException(400, "Instance token obrigatório")
     payload = {
-        "subdomain": SUBDOMAIN_DEFAULT,
+        "host": UAZAPI_HOST,
         "token": data.token,
         "label": data.label,
         "number_hint": data.number_hint,
@@ -27,9 +27,5 @@ def login(data: LoginRequest):
     encoded = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
     return {
         "jwt": encoded,
-        "profile": {
-            "label": data.label,
-            "subdomain": SUBDOMAIN_DEFAULT,
-            "number_hint": data.number_hint,
-        }
+        "profile": {"label": data.label, "host": UAZAPI_HOST, "number_hint": data.number_hint}
     }
