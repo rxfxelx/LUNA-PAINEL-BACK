@@ -2,17 +2,14 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# adiciona o router de enrich (name-image)
 from .routes import chats, messages, send, realtime, meta, name_image
 from .auth import router as auth_router
-
 
 def allowed_origins():
     raw = os.getenv("FRONTEND_ORIGIN", "*").strip()
     if not raw or raw == "*":
         return ["*"]
     return [o.strip() for o in raw.split(",") if o.strip()]
-
 
 app = FastAPI(title="Luna Backend")
 
@@ -24,11 +21,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/api/health")
 def health():
     return {"ok": True, "origins": allowed_origins()}
-
 
 # Rotas
 app.include_router(auth_router,       prefix="/api/auth", tags=["auth"])
