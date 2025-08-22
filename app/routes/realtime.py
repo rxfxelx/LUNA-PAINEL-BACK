@@ -7,17 +7,16 @@ router = APIRouter()
 
 @router.get("/sse")
 async def sse(events: str = "chats,messages,messages_update", user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    base = f"https://{sub}.uazapi.com/sse?token={tok}&events={events}"
+    host, tok = user["host"], user["token"]
+    url  = f"https://{host}/sse?token={tok}&events={events}"
 
-    async def generator():
+    async def gen():
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", base) as r:
+            async with client.stream("GET", url) as r:
                 if r.status_code >= 400:
                     text = await r.aread()
                     raise HTTPException(r.status_code, text.decode())
                 async for line in r.aiter_lines():
-                    if line is None:
-                        continue
+                    if line is None: continue
                     yield (line + "\n")
-    return StreamingResponse(generator(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream")
