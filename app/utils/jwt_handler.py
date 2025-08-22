@@ -9,10 +9,8 @@ def decode_jwt(authorization: str = Header(...)):
     token = authorization.split(" ", 1)[1]
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        if "subdomain" not in payload or "token" not in payload:
-            raise HTTPException(status_code=401, detail="JWT sem credenciais da instância")
+        if "host" not in payload or "token" not in payload:
+            raise HTTPException(status_code=401, detail="JWT sem host/token")
         return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="JWT expirado")
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"JWT inválido: {e}")
+        raise HTTPException(status_code=401, detail=f"JWT inválido/expirado: {e}")
