@@ -9,44 +9,33 @@ class MsgFind(BaseModel):
     chatid: str
     limit: int = 50
     offset: int = 0
-    sort: str | None = None  # ex: "-messageTimestamp"
+    sort: str | None = None
 
-def uaz_base(subdomain: str) -> str:
-    return f"https://{subdomain}.uazapi.com"
-
-def uaz_headers(token: str) -> dict:
-    return {"token": token, "Content-Type": "application/json"}
-
-def to_dict(model: BaseModel) -> dict:
-    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+def base(host: str) -> str: return f"https://{host}"
+def hdr(tok: str) -> dict:  return {"token": tok, "Content-Type": "application/json"}
+def to_dict(m: BaseModel) -> dict: return m.model_dump() if hasattr(m,"model_dump") else m.dict()
 
 @router.post("/messages")
 async def find_messages(body: MsgFind, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/message/find"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/message/find"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         data = r.json()
-        items = (
-            data.get("messages") or data.get("items") or data.get("data")
-            or data.get("result") or (data if isinstance(data, list) else [])
-        )
+        items = data.get("messages") or data.get("items") or data.get("data") or data.get("result") \
+                or (data if isinstance(data, list) else [])
         return {"items": items}
 
 @router.get("/messages/{chatid}")
 async def get_messages(chatid: str, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/message/find"
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/message/find"
     payload = {"chatid": chatid, "limit": 100, "offset": 0, "sort": "-messageTimestamp"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=payload)
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         data = r.json()
-        items = (
-            data.get("messages") or data.get("items") or data.get("data")
-            or data.get("result") or (data if isinstance(data, list) else [])
-        )
+        items = data.get("messages") or data.get("items") or data.get("data") or data.get("result") \
+                or (data if isinstance(data, list) else [])
         return {"items": items}
