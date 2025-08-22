@@ -17,7 +17,7 @@ class SendMedia(BaseModel):
 class SendButtons(BaseModel):
     number: str
     text: str
-    buttons: list[str]  # até 3
+    buttons: list[str]
 
 class SendList(BaseModel):
     number: str
@@ -26,51 +26,42 @@ class SendList(BaseModel):
     button_text: str
     sections: list[dict]
 
-def uaz_base(subdomain: str) -> str:
-    return f"https://{subdomain}.uazapi.com"
-
-def uaz_headers(token: str) -> dict:
-    return {"token": token, "Content-Type": "application/json"}
-
-def to_dict(m: BaseModel) -> dict:
-    return m.model_dump() if hasattr(m, "model_dump") else m.dict()
+def base(host: str) -> str: return f"https://{host}"
+def hdr(tok: str) -> dict:  return {"token": tok, "Content-Type": "application/json"}
+def to_dict(m: BaseModel) -> dict: return m.model_dump() if hasattr(m,"model_dump") else m.dict()
 
 @router.post("/send-text")
 async def send_text(body: SendText, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/send/text"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/send/text"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         return r.json()
 
 @router.post("/send-media")
 async def send_media(body: SendMedia, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/send/media"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/send/media"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         return r.json()
 
 @router.post("/send-buttons")
 async def send_buttons(body: SendButtons, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/send/buttons"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/send/buttons"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         return r.json()
 
 @router.post("/send-list")
 async def send_list(body: SendList, user=Depends(decode_jwt)):
-    sub = user["subdomain"]; tok = user["token"]
-    url = f"{uaz_base(sub)}/send/list"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=uaz_headers(tok), json=to_dict(body))
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
+    host, tok = user["host"], user["token"]
+    url = f"{base(host)}/send/list"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
+        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
         return r.json()
