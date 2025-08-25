@@ -11,16 +11,12 @@ def _uaz(ctx):
     return base, headers
 
 def _normalize_items(data):
-    """
-    Sempre retorna {items:[...]} e não descarta conteúdo de mídia.
-    Não inventa estrutura nova: só envolve em 'items' se preciso.
-    """
+    """Garante { items: [...] } sem perder mídia."""
     if isinstance(data, dict):
         for key in ("items", "messages", "data", "results"):
             val = data.get(key)
             if isinstance(val, list):
                 return {"items": val}
-        # não achei uma lista clara; às vezes a UAZAPI retorna o array direto
         return {"items": []}
     if isinstance(data, list):
         return {"items": data}
@@ -34,9 +30,8 @@ async def _req(cli: httpx.AsyncClient, method: str, url: str, headers: dict, jso
 @router.post("/messages")
 async def get_messages(body: dict, ctx=Depends(get_uazapi_ctx)):
     """
-    Busca mensagens de um chat com fallback agressivo de rotas UAZAPI.
-    body esperado (mínimo): { chatid: "5531...@s.whatsapp.net" }
-    aceita também: { wa_chatid: "...", limit, offset, sort }
+    Busca mensagens de um chat com fallback agressivo.
+    body: { chatid | wa_chatid, limit?, offset?, sort? }
     """
     chatid = (body.get("chatid") or body.get("wa_chatid") or "").strip()
     if not chatid:
@@ -47,34 +42,43 @@ async def get_messages(body: dict, ctx=Depends(get_uazapi_ctx)):
     sort   = body.get("sort", "-messageTimestamp")
 
     base, headers = _uaz(ctx)
-
-    # ==========
-    # Tentativas conhecidas (muito abrangente):
-    # ==========
     payload = {"chatid": chatid, "limit": limit, "offset": offset, "sort": sort}
     qparams = {"chatid": chatid, "limit": limit, "offset": offset, "sort": sort}
 
+    # Tentativas ampliadas (POST e GET; snake e CamelCase)
     attempts: list[tuple[str, str, dict | None, dict | None]] = [
-        # Padrões mais comuns (POST)
+        # POST mais prováveis
         ("POST", f"{base}/chat/messages", payload, None),
         ("POST", f"{base}/messages/find", payload, None),
+        ("POST", f"{base}/messages/search", payload, None),
+        ("POST", f"{base}/message/find", payload, None),
         ("POST", f"{base}/chat/findMessages", payload, None),
-        ("POST", f"{base}/chat/FindMessages", payload, None),       # CamelCase
-        ("POST", f"{base}/chat/GetMessages", payload, None),        # CamelCase
+        ("POST", f"{base}/chat/getMessages", payload, None),
+        ("POST", f"{base}/chat/GetMessages", payload, None),
+        ("POST", f"{base}/chat/GetChatMessages", payload, None),
+        ("POST", f"{base}/chat/getChatMessages", payload, None),
+        ("POST", f"{base}/chat/getHistory", payload, None),
+        ("POST", f"{base}/chat/GetHistory", payload, None),
         ("POST", f"{base}/messages", payload, None),
 
-        # GET com query
+        # GET equivalentes
         ("GET",  f"{base}/chat/messages", None, qparams),
         ("GET",  f"{base}/messages", None, qparams),
-        ("GET",  f"{base}/chat/getMessages", None, qparams),        # camel
-        ("GET",  f"{base}/chat/GetMessages", None, qparams),        # CamelCase
+        ("GET",  f"{base}/chat/getMessages", None, qparams),
+        ("GET",  f"{base}/chat/GetMessages", None, qparams),
+        ("GET",  f"{base}/chat/getChatMessages", None, qparams),
+        ("GET",  f"{base}/chat/GetChatMessages", None, qparams),
+        ("GET",  f"{base}/chat/getHistory", None, qparams),
+        ("GET",  f"{base}/chat/GetHistory", None, qparams),
     ]
 
+    tried = []
     last_status = 502
-    last_text   = "Nenhuma rota UAZAPI funcionou"
+    last_text = "Nenhuma rota UAZAPI funcionou"
 
     async with httpx.AsyncClient(timeout=30) as cli:
         for method, url, json_payload, params in attempts:
+            tried.append({"method": method, "url": url})
             r = await _req(cli, method, url, headers, json=json_payload, params=params)
             last_status, last_text = r.status_code, r.text
 
@@ -85,11 +89,12 @@ async def get_messages(body: dict, ctx=Depends(get_uazapi_ctx)):
                     raise HTTPException(status_code=502, detail="Resposta inválida da UAZAPI ao buscar mensagens")
                 return _normalize_items(data)
 
-            # 404/405: rota não existe/ método errado → tenta a próxima
+            # 404/405 → tenta próxima
             if r.status_code in (404, 405):
                 continue
 
-            # outros erros: já devolve
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+            # outros erros: devolve direto
+            raise HTTPException(status_code=r.status_code, detail={"upstream": last_text, "tried": tried})
 
-    raise HTTPException(status_code=last_status, detail=last_text)
+    # nenhuma rota bateu: devolve 404 com diagnóstico
+    raise HTTPException(status_code=404, detail={"message": "Not Found em todas rotas de mensagens", "tried": tried, "upstream": last_text})
