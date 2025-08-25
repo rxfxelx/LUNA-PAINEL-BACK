@@ -1,14 +1,20 @@
 # app/routes/name_image.py
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Response
 from app.routes.deps import get_uazapi_ctx  # mesmo deps usado nas outras rotas
 
 router = APIRouter()
 
+
 def _uaz(ctx):
     base = f"https://{ctx['host']}"
-    headers = {"token": ctx["token"]}
+    headers = {
+        "token": ctx["token"],
+        "accept": "application/json",
+        "cache-control": "no-cache",
+    }
     return base, headers
+
 
 def _normalize(resp: dict) -> dict:
     """
@@ -19,20 +25,46 @@ def _normalize(resp: dict) -> dict:
     if not isinstance(resp, dict):
         return {"name": None, "image": None, "imagePreview": None}
 
-    name = resp.get("name") or resp.get("wa_name") or resp.get("fullName") or resp.get("displayName")
+    name = (
+        resp.get("name")
+        or resp.get("wa_name")
+        or resp.get("fullName")
+        or resp.get("displayName")
+    )
     image = resp.get("image") or resp.get("photo") or resp.get("profileImage")
-    image_preview = resp.get("imagePreview") or resp.get("photoPreview") or resp.get("preview")
+    image_preview = (
+        resp.get("imagePreview")
+        or resp.get("photoPreview")
+        or resp.get("preview")
+    )
 
-    return {
-        "name": name,
-        "image": image,
-        "imagePreview": image_preview
-    }
+    return {"name": name, "image": image, "imagePreview": image_preview}
+
 
 async def _try(cli: httpx.AsyncClient, method: str, url: str, headers: dict, json=None, params=None):
     if method == "GET":
         return await cli.get(url, headers=headers, params=params)
     return await cli.post(url, headers=headers, json=json)
+
+
+def _payload_is_url_expired(res: httpx.Response) -> bool:
+    try:
+        ct = (res.headers.get("content-type") or "").lower()
+    except Exception:
+        ct = ""
+    if "application/json" in ct:
+        try:
+            res.json()
+            return False  # JSON válido -> não é o caso
+        except Exception:
+            pass
+    # não é JSON válido; checa texto
+    try:
+        txt = (res.text or "").strip().lower()
+    except Exception:
+        txt = ""
+    return "url signature expired" in txt
+
 
 @router.post("/name-image")
 async def get_name_and_image(
@@ -84,14 +116,30 @@ async def get_name_and_image(
             last_status, last_text = r.status_code, r.text
 
             if 200 <= r.status_code < 300:
+                # Pode vir 200 com texto "URL signature expired" ou payload não-JSON
+                if _payload_is_url_expired(r):
+                    # Devolve um normalizado "vazio" para o front cair no fallback e tentar depois
+                    resp = Response(
+                        content='{"name":null,"image":null,"imagePreview":null}',
+                        media_type="application/json",
+                    )
+                    resp.headers["Cache-Control"] = "no-store"
+                    return resp
+
                 try:
                     data = r.json()
                 except Exception:
                     raise HTTPException(status_code=502, detail="Resposta inválida da UAZAPI em name-image")
-                return _normalize(data)
+
+                norm = _normalize(data)
+                resp = Response(content=httpx.Response(200, json=norm).content, media_type="application/json")
+                resp.headers["Cache-Control"] = "no-store"
+                return resp
 
             if r.status_code in (404, 405):
-                continue
+                continue  # tenta próxima rota
+
+            # Qualquer outro erro: repassa
             raise HTTPException(status_code=r.status_code, detail=last_text)
 
     raise HTTPException(status_code=last_status, detail=last_text)
