@@ -1,41 +1,30 @@
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from ..utils.jwt_handler import decode_jwt
+# app/routes/messages.py
 import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from app.routes.deps import get_uazapi_ctx
 
 router = APIRouter()
 
-class MsgFind(BaseModel):
-    chatid: str
-    limit: int = 50
-    offset: int = 0
-    sort: str | None = None
-
-def base(host: str) -> str: return f"https://{host}"
-def hdr(tok: str) -> dict:  return {"token": tok, "Content-Type": "application/json"}
-def to_dict(m: BaseModel) -> dict: return m.model_dump() if hasattr(m,"model_dump") else m.dict()
+def _uaz(ctx):
+    base = f"https://{ctx['host']}"
+    headers = {"token": ctx["token"]}
+    return base, headers
 
 @router.post("/messages")
-async def find_messages(body: MsgFind, user=Depends(decode_jwt)):
-    host, tok = user["host"], user["token"]
-    url = f"{base(host)}/message/find"
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        r = await c.post(url, headers=hdr(tok), json=to_dict(body))
-        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
-        data = r.json()
-        items = data.get("messages") or data.get("items") or data.get("data") or data.get("result") \
-                or (data if isinstance(data, list) else [])
-        return {"items": items}
+async def get_messages(body: dict, ctx=Depends(get_uazapi_ctx)):
+    """
+    Busca mensagens de um chat.
+    Espera body com: { chatid, limit, sort, ... }
+    Encaminha para UAZAPI (ajuste o caminho conforme sua API — aqui usamos /chat/messages).
+    """
+    chatid = (body.get("chatid") or "").strip()
+    if not chatid:
+        raise HTTPException(status_code=400, detail="chatid é obrigatório")
 
-@router.get("/messages/{chatid}")
-async def get_messages(chatid: str, user=Depends(decode_jwt)):
-    host, tok = user["host"], user["token"]
-    url = f"{base(host)}/message/find"
-    payload = {"chatid": chatid, "limit": 100, "offset": 0, "sort": "-messageTimestamp"}
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        r = await c.post(url, headers=hdr(tok), json=payload)
-        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
-        data = r.json()
-        items = data.get("messages") or data.get("items") or data.get("data") or data.get("result") \
-                or (data if isinstance(data, list) else [])
-        return {"items": items}
+    base, headers = _uaz(ctx)
+    url = f"{base}/chat/messages"
+    async with httpx.AsyncClient(timeout=30) as cli:
+        r = await cli.post(url, json=body, headers=headers)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
