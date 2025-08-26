@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # rotas internas
-from .routes import chats, messages, send, realtime, meta, name_image
+from .routes import chats, messages, send, realtime, meta, name_image, crm
 from .auth import router as auth_router  # contém /api/auth/login, /api/auth/check, /api/auth/debug
 
 def allowed_origins():
@@ -49,3 +49,6 @@ app.include_router(send.router,       prefix="/api",      tags=["send"])
 app.include_router(realtime.router,   prefix="/api",      tags=["sse"])
 app.include_router(meta.router,       prefix="/api",      tags=["meta"])
 app.include_router(name_image.router, prefix="/api",      tags=["name-image"])
+
+# >>> CRM – NOVO <<<
+app.include_router(crm.router,        prefix="/api/crm", tags=["crm"])
