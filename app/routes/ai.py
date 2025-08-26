@@ -10,8 +10,7 @@ router = APIRouter()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# Classes finais (apenas 3): Contatos, Lead, Lead Quente
-STAGES = ["Contatos", "Lead", "Lead Quente"]
+STAGES = ["contatos", "lead", "lead_quente"]
 
 class Msg(BaseModel):
     role: str
@@ -28,46 +27,39 @@ class ClassifyResp(BaseModel):
     reason: str
 
 SYSTEM_PROMPT = (
-    "Você é um classificador de estágio de lead para uma loja.\n\n"
-    "Receberá um histórico de mensagens (cliente/atendente) e deve classificar o estágio atual do lead em UMA das categorias abaixo, "
-    "devolvendo JSON estrito no formato: {\"stage\":\"<uma_das_opções>\", \"confidence\":0-1, \"reason\":\"breve justificativa\"}.\n\n"
-    "Categorias possíveis (retorne EXATAMENTE uma delas):\n"
-    "- Contatos\n"
-    "- Lead\n"
-    "- Lead Quente\n\n"
-    "Regras de decisão (use com rigor):\n"
-    "1) Contatos — início/frio: poucas mensagens, sem engajamento real; cliente não respondeu; mensagens automáticas/links (ex.: cardápio, catálogo, site) sem diálogo. NÃO infira intenção de compra por links automáticos.\n"
-    "2) Lead — há interesse claro do cliente (perguntas como: 'como funciona', 'pode me mostrar', 'quais os valores', 'tem integração', 'me explica', 'como contratar', 'onde fica', 'atende minha região', etc.) ou comparações/avaliações. Não precisa haver preço final ou encaminhamento.\n"
-    "3) Lead Quente — SOMENTE quando o atendente afirma explicitamente que vai transferir/encaminhar o atendimento, que outra pessoa/setor vai entrar em contato, ou que o contato foi repassado; OU quando há confirmação explícita de fechamento/contratação/pagamento.\n"
-    "- Gatilhos típicos para 'Lead Quente': 'vou te passar para...', 'vou encaminhar', 'vou transferir', 'o setor X vai te chamar', "
-    "'vou pedir para fulano falar com você', 'nossa equipe comercial vai entrar em contato', 'já fechei/contratei/paguei'.\n"
-    "- Ignore mensagens de boas-vindas automáticas e links como 'acesse nosso cardápio/catálogos' como sinal de fechamento.\n"
-    "- Seja conservador para marcar 'Lead Quente'.\n\n"
-    "Retorne SEMPRE JSON estrito e válido com 'stage' sendo exatamente uma das três opções acima, 'confidence' entre 0 e 1, e 'reason' curta.\n"
+    "Você classifica o estágio de um contato em uma conversa de WhatsApp com base no histórico.\n"
+    "RETORNE STRICT JSON com as chaves: {\"stage\":\"contatos|lead|lead_quente\",\"confidence\":0-1,\"reason\":\"...\"}.\n\n"
+    "Definições (USE APENAS UMA):\n"
+    "• contatos  – conversa inicial ou sem sinais claros de interesse (poucas mensagens curtas, saudações, links genéricos, cardápio etc.).\n"
+    "• lead      – há interesse/engajamento: perguntas específicas, dúvidas, comparações, tentativa de entender oferta/benefícios.\n"
+    "• lead_quente – SOMENTE quando a conversa indica transferência para humano/setor/consultor, ou agendamento explícito de atendimento, ou confirmação de que alguém entrará em contato (ex: \"vou te passar para o setor X\", \"alguém vai falar com você\", \"vou encaminhar seu contato\", \"o time comercial vai te chamar\").\n\n"
+    "Atenção:\n"
+    "- Mensagens automáticas com links (cardápio, site, catálogo) NÃO significam lead_quente.\n"
+    "- Prefira 'contatos' se houver pouca informação objetiva.\n"
+    "- Prefira 'lead' quando houver perguntas/demonstração de interesse.\n"
+    "- Use 'lead_quente' apenas quando HÁ frase de encaminhamento/transferência humano-setor.\n"
 )
 
 async def _openai_chat(messages):
-  if not OPENAI_API_KEY:
-      raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
-
-  url = "https://api.openai.com/v1/chat/completions"
-  headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-  payload = {
-      "model": OPENAI_MODEL or "gpt-4o-mini",
-      "messages": messages,
-      "temperature": 0.1,
-      "response_format": {"type": "json_object"},
-  }
-  async with httpx.AsyncClient(timeout=30) as cli:
-      r = await cli.post(url, headers=headers, json=payload)
-      if r.status_code >= 400:
-          raise HTTPException(status_code=r.status_code, detail=r.text)
-      data = r.json()
-      try:
-          content = data["choices"][0]["message"]["content"]
-      except Exception:
-          raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
-      return content
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL or "gpt-4o-mini",
+        "messages": messages,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    async with httpx.AsyncClient(timeout=40) as cli:
+        r = await cli.post(url, headers=headers, json=payload)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        data = r.json()
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
 
 @router.post("/ai/classify", response_model=ClassifyResp)
 async def classify(req: ClassifyReq):
@@ -79,13 +71,10 @@ async def classify(req: ClassifyReq):
         lines = []
         for m in req.history:
             role = "Cliente" if m.role == "user" else ("Atendente" if m.role == "assistant" else m.role)
-            # normaliza minúsculas para reduzir ruído
             lines.append(f"{role}: {m.content}")
-        user_text = "\n".join(lines)
+        msgs.append({"role": "user", "content": "\n".join(lines)})
     else:
-        user_text = req.text or ""
-
-    msgs.append({"role": "user", "content": user_text})
+        msgs.append({"role": "user", "content": req.text})
 
     raw = await _openai_chat(msgs)
 
@@ -98,17 +87,16 @@ async def classify(req: ClassifyReq):
             raise HTTPException(status_code=502, detail="IA não retornou JSON válido.")
         obj = json.loads(m.group(0))
 
-    stage = str(obj.get("stage", "")).strip()
+    stage = str(obj.get("stage", "")).strip().lower()
     if stage not in STAGES:
-        stage = "Contatos"
+        stage = "contatos"
 
-    conf = obj.get("confidence", 0.6)
     try:
-        conf = float(conf)
+        conf = float(obj.get("confidence", 0.5))
     except Exception:
-        conf = 0.6
+        conf = 0.5
     conf = max(0.0, min(1.0, conf))
 
-    reason = str(obj.get("reason", "")).strip() or "Classificação automática."
+    reason = (obj.get("reason") or "Classificação automática").strip()
 
     return ClassifyResp(stage=stage, confidence=conf, reason=reason)
