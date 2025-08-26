@@ -36,10 +36,10 @@ SYSTEM_PROMPT = (
     "- Lead\n"
     "- Lead Quente\n\n"
     "Regras de decisão (use com rigor):\n"
-    "1) Contatos — início/frio: poucas mensagens, sem engajamento real; cliente não respondeu; ou apenas mensagem automática/link (ex.: cardápio, catálogo, link) sem diálogo. NÃO infira intenção de compra por links automáticos.\n"
-    "2) Lead — há conversa/engajamento com interesse claro: cliente faz perguntas relevantes, compara, busca detalhes (mas ainda sem handoff/encaminhamento final).\n"
+    "1) Contatos — início/frio: poucas mensagens, sem engajamento real; cliente não respondeu; mensagens automáticas/links (ex.: cardápio, catálogo, site) sem diálogo. NÃO infira intenção de compra por links automáticos.\n"
+    "2) Lead — há interesse claro do cliente (perguntas como: 'como funciona', 'pode me mostrar', 'quais os valores', 'tem integração', 'me explica', 'como contratar', 'onde fica', 'atende minha região', etc.) ou comparações/avaliações. Não precisa haver preço final ou encaminhamento.\n"
     "3) Lead Quente — SOMENTE quando o atendente afirma explicitamente que vai transferir/encaminhar o atendimento, que outra pessoa/setor vai entrar em contato, ou que o contato foi repassado; OU quando há confirmação explícita de fechamento/contratação/pagamento.\n"
-    "- Exemplos típicos de gatilhos para 'Lead Quente': 'vou te passar para...', 'vou encaminhar', 'vou transferir', 'o setor X vai te chamar', "
+    "- Gatilhos típicos para 'Lead Quente': 'vou te passar para...', 'vou encaminhar', 'vou transferir', 'o setor X vai te chamar', "
     "'vou pedir para fulano falar com você', 'nossa equipe comercial vai entrar em contato', 'já fechei/contratei/paguei'.\n"
     "- Ignore mensagens de boas-vindas automáticas e links como 'acesse nosso cardápio/catálogos' como sinal de fechamento.\n"
     "- Seja conservador para marcar 'Lead Quente'.\n\n"
@@ -47,30 +47,27 @@ SYSTEM_PROMPT = (
 )
 
 async def _openai_chat(messages):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
+  if not OPENAI_API_KEY:
+      raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL or "gpt-4o-mini",
-        "messages": messages,
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
-    async with httpx.AsyncClient(timeout=30) as cli:
-        r = await cli.post(url, headers=headers, json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except Exception:
-            raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
-        return content
+  url = "https://api.openai.com/v1/chat/completions"
+  headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+  payload = {
+      "model": OPENAI_MODEL or "gpt-4o-mini",
+      "messages": messages,
+      "temperature": 0.1,
+      "response_format": {"type": "json_object"},
+  }
+  async with httpx.AsyncClient(timeout=30) as cli:
+      r = await cli.post(url, headers=headers, json=payload)
+      if r.status_code >= 400:
+          raise HTTPException(status_code=r.status_code, detail=r.text)
+      data = r.json()
+      try:
+          content = data["choices"][0]["message"]["content"]
+      except Exception:
+          raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
+      return content
 
 @router.post("/ai/classify", response_model=ClassifyResp)
 async def classify(req: ClassifyReq):
@@ -82,6 +79,7 @@ async def classify(req: ClassifyReq):
         lines = []
         for m in req.history:
             role = "Cliente" if m.role == "user" else ("Atendente" if m.role == "assistant" else m.role)
+            # normaliza minúsculas para reduzir ruído
             lines.append(f"{role}: {m.content}")
         user_text = "\n".join(lines)
     else:
@@ -104,11 +102,11 @@ async def classify(req: ClassifyReq):
     if stage not in STAGES:
         stage = "Contatos"
 
-    conf = obj.get("confidence", 0.5)
+    conf = obj.get("confidence", 0.6)
     try:
         conf = float(conf)
     except Exception:
-        conf = 0.5
+        conf = 0.6
     conf = max(0.0, min(1.0, conf))
 
     reason = str(obj.get("reason", "")).strip() or "Classificação automática."
