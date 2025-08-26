@@ -9,13 +9,13 @@ from app.routes.deps import get_uazapi_ctx  # host/token da UAZAPI
 
 router = APIRouter()
 
+# Estágios OFICIAIS (sem "sem_resposta" e "descartado")
 STAGES: List[str] = [
-    "novo",
-    "sem_resposta",
-    "interessado",
-    "em_negociacao",
-    "fechou",
-    "descartado",
+    "lead",
+    "lead_qualificado",
+    "lead_quente",
+    "prospectivo_cliente",
+    "cliente",
 ]
 
 DATA_DIR = os.getenv("CRM_DATA_DIR", "/app/data")
@@ -61,11 +61,9 @@ def _normalize_chatid(chatid: Optional[str] = None, number: Optional[str] = None
     if not raw:
         return ""
 
-    # só dígitos => é number
     if re.fullmatch(r"\d{10,15}", raw):
         return f"{raw}@s.whatsapp.net"
 
-    # já veio @g.us (grupo) ou outro sufixo? mantém
     if "@" in raw:
         return raw
 
@@ -79,7 +77,7 @@ _load_store()
 async def crm_views(user=Depends(get_current_user)):
     counts = {s: 0 for s in STAGES}
     for v in _store.values():
-        st = v.get("stage", "novo")
+        st = v.get("stage", "lead")
         if st in counts:
             counts[st] += 1
     return {"counts": counts, "stages": STAGES}
@@ -113,16 +111,15 @@ async def crm_list(
 
 @router.get("/item")
 async def crm_item(chatid: str = Query(...), user=Depends(get_current_user)):
-    return _store.get(chatid) or {"chatid": chatid, "stage": "novo", "notes": "", "updated_at": 0}
+    return _store.get(chatid) or {"chatid": chatid, "stage": "lead", "notes": "", "updated_at": 0}
 
 
 @router.post("/status")
 async def crm_set_status(
     payload: Dict = Body(..., example={
         "chatid": "55319...@s.whatsapp.net",
-        "stage": "interessado",
+        "stage": "lead_qualificado",
         "notes": "",
-        # OU: "wa_chatid": "...", OU: "number": "55319..."
     }),
     user=Depends(get_current_user),
 ):
@@ -162,15 +159,14 @@ async def crm_sync_from_uazapi(
     user=Depends(get_current_user),
 ):
     """
-    Sincroniza automaticamente com a lista de chats da UAZAPI.
-    Cria registros que não existirem no estágio 'novo'.
+    Sincroniza com a lista de chats da UAZAPI.
+    Cria registros que não existirem no estágio 'lead'.
     """
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
 
     created = 0
     async with httpx.AsyncClient(timeout=25) as cli:
-        # tenta múltiplas variações de endpoint
         attempts = [
             ("POST", f"{base}/chat/list", {"limit": limit, "offset": 0}),
             ("GET",  f"{base}/chat/list?limit={limit}&offset=0", None),
@@ -199,7 +195,7 @@ async def crm_sync_from_uazapi(
             if chatid not in _store:
                 _store[chatid] = {
                     "chatid": chatid,
-                    "stage": "novo",
+                    "stage": "lead",
                     "notes": "",
                     "meta": {},
                     "updated_at": _now(),
@@ -209,3 +205,14 @@ async def crm_sync_from_uazapi(
     if created:
         _save_store()
     return {"ok": True, "created": created, "total": len(_store)}
+
+
+# --------- Helper interno para o módulo da IA gravar status sem Depends ---------
+def set_status_internal(chatid: str, stage: str, notes: str = "", meta: Optional[dict] = None):
+    if stage not in STAGES:
+        stage = "lead"
+    rec = _store.get(chatid) or {"chatid": chatid}
+    rec.update({"stage": stage, "notes": notes or "", "meta": meta or {}, "updated_at": _now()})
+    _store[chatid] = rec
+    _save_store()
+    return rec
