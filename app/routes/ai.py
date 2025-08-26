@@ -10,8 +10,8 @@ router = APIRouter()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-# Classes finais (apenas 3)
-STAGES = ["Lead", "Lead Quente", "Cliente"]
+# Classes finais (apenas 3): Contatos, Lead, Lead Quente
+STAGES = ["Contatos", "Lead", "Lead Quente"]
 
 class Msg(BaseModel):
     role: str
@@ -32,17 +32,18 @@ SYSTEM_PROMPT = (
     "Receberá um histórico de mensagens (cliente/atendente) e deve classificar o estágio atual do lead em UMA das categorias abaixo, "
     "devolvendo JSON estrito no formato: {\"stage\":\"<uma_das_opções>\", \"confidence\":0-1, \"reason\":\"breve justificativa\"}.\n\n"
     "Categorias possíveis (retorne EXATAMENTE uma delas):\n"
+    "- Contatos\n"
     "- Lead\n"
-    "- Lead Quente\n"
-    "- Cliente\n\n"
+    "- Lead Quente\n\n"
     "Regras de decisão (use com rigor):\n"
-    "1) Lead — caso inicial/frio: poucos envios, sem engajamento real, sem perguntas; ou o cliente ainda não respondeu; ou apenas respostas automáticas/link (ex.: cardápio, catálogo, link) sem diálogo. Não infira intenção de compra.\n"
-    "2) Lead Quente — há conversa em andamento com interesse claro: o cliente faz perguntas relevantes, compara opções, demonstra avaliar compra (mas ainda sem handoff/encaminhamento final). Pode pedir detalhes, disponibilidade, como funciona etc.\n"
-    "3) Cliente — SOMENTE quando o atendente afirma explicitamente que vai transferir/encaminhar para outra pessoa/setor, que alguém entrará em contato, ou que foi repassado o contato; ou uma confirmação explícita de fechamento/contratação. Mensagens automáticas ou links sozinhos NÃO são 'Cliente'.\n\n"
-    "Observações importantes:\n"
-    "- Ignore mensagens automáticas de boas-vindas, links de cardápio/catálogo ou respostas padrão como sinal de 'Cliente'.\n"
-    "- Seja conservador para marcar 'Cliente': procure termos como 'vou te passar para', 'vou encaminhar', 'o setor X vai te chamar', 'vou pedir para fulano falar com você', 'já fechei', 'contratei'.\n"
-    "- Retorne SEMPRE JSON estrito e válido com 'stage' sendo exatamente uma das três opções, 'confidence' entre 0 e 1, e 'reason' curta.\n"
+    "1) Contatos — início/frio: poucas mensagens, sem engajamento real; cliente não respondeu; ou apenas mensagem automática/link (ex.: cardápio, catálogo, link) sem diálogo. NÃO infira intenção de compra por links automáticos.\n"
+    "2) Lead — há conversa/engajamento com interesse claro: cliente faz perguntas relevantes, compara, busca detalhes (mas ainda sem handoff/encaminhamento final).\n"
+    "3) Lead Quente — SOMENTE quando o atendente afirma explicitamente que vai transferir/encaminhar o atendimento, que outra pessoa/setor vai entrar em contato, ou que o contato foi repassado; OU quando há confirmação explícita de fechamento/contratação/pagamento.\n"
+    "- Exemplos típicos de gatilhos para 'Lead Quente': 'vou te passar para...', 'vou encaminhar', 'vou transferir', 'o setor X vai te chamar', "
+    "'vou pedir para fulano falar com você', 'nossa equipe comercial vai entrar em contato', 'já fechei/contratei/paguei'.\n"
+    "- Ignore mensagens de boas-vindas automáticas e links como 'acesse nosso cardápio/catálogos' como sinal de fechamento.\n"
+    "- Seja conservador para marcar 'Lead Quente'.\n\n"
+    "Retorne SEMPRE JSON estrito e válido com 'stage' sendo exatamente uma das três opções acima, 'confidence' entre 0 e 1, e 'reason' curta.\n"
 )
 
 async def _openai_chat(messages):
@@ -57,7 +58,7 @@ async def _openai_chat(messages):
     payload = {
         "model": OPENAI_MODEL or "gpt-4o-mini",
         "messages": messages,
-        "temperature": 0.2,
+        "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
     async with httpx.AsyncClient(timeout=30) as cli:
@@ -78,7 +79,6 @@ async def classify(req: ClassifyReq):
 
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     if req.history:
-        # concatena o histórico em um único bloco
         lines = []
         for m in req.history:
             role = "Cliente" if m.role == "user" else ("Atendente" if m.role == "assistant" else m.role)
@@ -102,8 +102,7 @@ async def classify(req: ClassifyReq):
 
     stage = str(obj.get("stage", "")).strip()
     if stage not in STAGES:
-        # fallback conservador
-        stage = "Lead"
+        stage = "Contatos"
 
     conf = obj.get("confidence", 0.5)
     try:
