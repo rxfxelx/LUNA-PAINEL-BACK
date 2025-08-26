@@ -47,77 +47,72 @@ SYSTEM_PROMPT = (
 )
 
 async def _openai_chat(messages):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
+  if not OPENAI_API_KEY:
+      raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
 
-    # chamada minimalista via HTTP para /v1/chat/completions (OpenAI)
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL or "gpt-4o-mini",
-        "messages": messages,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
-    async with httpx.AsyncClient(timeout=30) as cli:
-        r = await cli.post(url, headers=headers, json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except Exception:
-            raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
-        return content
+  url = "https://api.openai.com/v1/chat/completions"
+  headers = {
+      "Authorization": f"Bearer {OPENAI_API_KEY}",
+      "Content-Type": "application/json",
+  }
+  payload = {
+      "model": OPENAI_MODEL or "gpt-4o-mini",
+      "messages": messages,
+      "temperature": 0.2,
+      "response_format": {"type": "json_object"},
+  }
+  async with httpx.AsyncClient(timeout=30) as cli:
+      r = await cli.post(url, headers=headers, json=payload)
+      if r.status_code >= 400:
+          raise HTTPException(status_code=r.status_code, detail=r.text)
+      data = r.json()
+      try:
+          content = data["choices"][0]["message"]["content"]
+      except Exception:
+          raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
+      return content
 
 @router.post("/ai/classify", response_model=ClassifyResp)
 async def classify(req: ClassifyReq):
-    # Monta mensagens para o chat
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    user_text = ""
+  msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+  user_text = ""
 
-    if req.history:
-        # concatena o histórico num bloco único
-        lines = []
-        for m in req.history:
-            role = "Cliente" if m.role == "user" else ("Atendente" if m.role == "assistant" else m.role)
-            lines.append(f"{role}: {m.content}")
-        user_text = "\n".join(lines)
-    elif req.text:
-        user_text = req.text
-    else:
-        raise HTTPException(status_code=400, detail="Forneça 'history' ou 'text'.")
+  if req.history:
+      lines = []
+      for m in req.history:
+          role = "Cliente" if m.role == "user" else ("Atendente" if m.role == "assistant" else m.role)
+          lines.append(f"{role}: {m.content}")
+      user_text = "\n".join(lines)
+  elif req.text:
+      user_text = req.text
+  else:
+      raise HTTPException(status_code=400, detail="Forneça 'history' ou 'text'.")
 
-    msgs.append({"role": "user", "content": user_text})
+  msgs.append({"role": "user", "content": user_text})
 
-    raw = await _openai_chat(msgs)
+  raw = await _openai_chat(msgs)
 
-    # Tenta parsear o JSON estrito
-    import json
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        # fallback: tenta achar um objeto JSON dentro
-        import re
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        if not m:
-            raise HTTPException(status_code=502, detail="IA não retornou JSON válido.")
-        obj = json.loads(m.group(0))
+  import json
+  try:
+      obj = json.loads(raw)
+  except Exception:
+      import re
+      m = re.search(r"\{.*\}", raw, flags=re.S)
+      if not m:
+          raise HTTPException(status_code=502, detail="IA não retornou JSON válido.")
+      obj = json.loads(m.group(0))
 
-    stage = str(obj.get("stage", "")).strip()
-    if stage not in STAGES:
-        stage = "novo"
+  stage = str(obj.get("stage", "")).strip()
+  if stage not in STAGES:
+      stage = "novo"
 
-    conf = obj.get("confidence", 0.5)
-    try:
-        conf = float(conf)
-    except Exception:
-        conf = 0.5
-    conf = max(0.0, min(1.0, conf))
+  conf = obj.get("confidence", 0.5)
+  try:
+      conf = float(conf)
+  except Exception:
+      conf = 0.5
+  conf = max(0.0, min(1.0, conf))
 
-    reason = str(obj.get("reason", "")).strip() or "Classificação automática."
+  reason = str(obj.get("reason", "")).strip() or "Classificação automática."
 
-    return ClassifyResp(stage=stage, confidence=conf, reason=reason)
+  return ClassifyResp(stage=stage, confidence=conf, reason=reason)
