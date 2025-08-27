@@ -27,54 +27,68 @@ class ClassifyResp(BaseModel):
     reason: str
 
 SYSTEM_PROMPT = (
-    "Você classifica o estágio de um contato em uma conversa de WhatsApp com base no histórico.\n"
-    "RETORNE STRICT JSON com as chaves: {\"stage\":\"contatos|lead|lead_quente\",\"confidence\":0-1,\"reason\":\"...\"}.\n\n"
-    "Definições (USE APENAS UMA):\n"
-    "• contatos  – conversa inicial ou sem sinais claros de interesse (poucas mensagens curtas, saudações, links genéricos, cardápio etc.).\n"
-    "• lead      – há interesse/engajamento: perguntas específicas, dúvidas, comparações, tentativa de entender oferta/benefícios.\n"
-    "• lead_quente – SOMENTE quando a conversa indica transferência para humano/setor/consultor, ou agendamento explícito de atendimento, ou confirmação de que alguém entrará em contato (ex: \"vou te passar para o setor X\", \"alguém vai falar com você\", \"vou encaminhar seu contato\", \"o time comercial vai te chamar\").\n\n"
-    "Atenção:\n"
-    "- Mensagens automáticas com links (cardápio, site, catálogo) NÃO significam lead_quente.\n"
-    "- Prefira 'contatos' se houver pouca informação objetiva.\n"
-    "- Prefira 'lead' quando houver perguntas/demonstração de interesse.\n"
-    "- Use 'lead_quente' apenas quando HÁ frase de encaminhamento/transferência humano-setor.\n"
+    "Você é um classificador de estágio de lead para conversas de WhatsApp.\n"
+    "Classifique APENAS em uma das chaves:\n"
+    "- contatos\n"
+    "- lead\n"
+    "- lead_quente\n\n"
+    "Definições (importante):\n"
+    "• contatos: a loja enviou mensagem mas o cliente ainda não engajou, OU só respondeu 1 vez sem demonstrar interesse claro.\n"
+    "• lead: o cliente demonstrou interesse real (fez perguntas, pediu informações, aceitou ver catálogo/mostrar algo, etc.).\n"
+    "• lead_quente: quando o ATENDENTE sinaliza que vai TRANSFERIR/ENCAMINHAR para outra pessoa/setor/time comercial, ou colocar o cliente em contato com alguém. Exemplos: "
+    "\"vou te passar para o comercial\", \"vou encaminhar seu contato\", \"alguém do time vai te chamar\", \"vou te transferir\", \"o time/comercial vai entrar em contato\".\n"
+    "⚠️ Não marque 'lead_quente' por causa de mensagens automáticas com links (ex.: cardápio, catálogo) sem o atendente dizer explicitamente que transferirá/encaminhará.\n"
+    "Regras:\n"
+    "1) Analise todo o histórico disponível, mantendo foco no sentido prático.\n"
+    "2) Só marque 'lead_quente' se EXISTIR mensagem do ATENDENTE com intenção explícita de transferência/encaminhamento/colocar em contato.\n"
+    "3) Seja conservador: se houver dúvida entre 'lead' e 'lead_quente', prefira 'lead'.\n"
+    "4) Responda STRICT JSON:\n"
+    "{ \"stage\": \"contatos|lead|lead_quente\", \"confidence\": 0-1, \"reason\": \"breve justificativa\" }\n"
 )
 
 async def _openai_chat(messages):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": OPENAI_MODEL or "gpt-4o-mini",
-        "messages": messages,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
-    async with httpx.AsyncClient(timeout=40) as cli:
-        r = await cli.post(url, headers=headers, json=payload)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-        try:
-            return data["choices"][0]["message"]["content"]
-        except Exception:
-            raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
+  if not OPENAI_API_KEY:
+      raise HTTPException(status_code=503, detail="OPENAI_API_KEY ausente no backend")
+
+  url = "https://api.openai.com/v1/chat/completions"
+  headers = {
+      "Authorization": f"Bearer {OPENAI_API_KEY}",
+      "Content-Type": "application/json",
+  }
+  payload = {
+      "model": OPENAI_MODEL or "gpt-4o-mini",
+      "messages": messages,
+      "temperature": 0.2,
+      "response_format": {"type": "json_object"},
+  }
+  async with httpx.AsyncClient(timeout=30) as cli:
+      r = await cli.post(url, headers=headers, json=payload)
+      if r.status_code >= 400:
+          raise HTTPException(status_code=r.status_code, detail=r.text)
+      data = r.json()
+      try:
+          content = data["choices"][0]["message"]["content"]
+      except Exception:
+          raise HTTPException(status_code=502, detail="Resposta inesperada do provedor de IA.")
+      return content
 
 @router.post("/ai/classify", response_model=ClassifyResp)
 async def classify(req: ClassifyReq):
-    if not (req.history or req.text):
-        raise HTTPException(status_code=400, detail="Forneça 'history' ou 'text'.")
-
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    user_text = ""
+
     if req.history:
         lines = []
         for m in req.history:
             role = "Cliente" if m.role == "user" else ("Atendente" if m.role == "assistant" else m.role)
             lines.append(f"{role}: {m.content}")
-        msgs.append({"role": "user", "content": "\n".join(lines)})
+        user_text = "\n".join(lines)
+    elif req.text:
+        user_text = req.text
     else:
-        msgs.append({"role": "user", "content": req.text})
+        raise HTTPException(status_code=400, detail="Forneça 'history' ou 'text'.")
+
+    msgs.append({"role": "user", "content": user_text})
 
     raw = await _openai_chat(msgs)
 
@@ -91,12 +105,13 @@ async def classify(req: ClassifyReq):
     if stage not in STAGES:
         stage = "contatos"
 
+    conf = obj.get("confidence", 0.6)
     try:
-        conf = float(obj.get("confidence", 0.5))
+        conf = float(conf)
     except Exception:
-        conf = 0.5
+        conf = 0.6
     conf = max(0.0, min(1.0, conf))
 
-    reason = (obj.get("reason") or "Classificação automática").strip()
+    reason = str(obj.get("reason", "")).strip() or "Classificação automática."
 
     return ClassifyResp(stage=stage, confidence=conf, reason=reason)
