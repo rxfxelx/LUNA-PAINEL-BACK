@@ -4,8 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # rotas internas
-from .routes import chats, messages, send, realtime, meta, name_image, crm, ai, media
+from .routes import chats, messages, send, realtime, meta, name_image, crm, ai
 from .auth import router as auth_router  # contém /api/auth/login, /api/auth/check, /api/auth/debug
+from .routes import media  # <<< ADICIONADO
 
 def allowed_origins():
     raw = (os.getenv("FRONTEND_ORIGIN") or "*").strip()
@@ -46,12 +47,10 @@ app.include_router(send.router,       prefix="/api",      tags=["send"])
 app.include_router(realtime.router,   prefix="/api",      tags=["sse"])
 app.include_router(meta.router,       prefix="/api",      tags=["meta"])
 app.include_router(name_image.router, prefix="/api",      tags=["name-image"])
+app.include_router(media.router,      prefix="/api/media",tags=["media"])  # <<< ADICIONADO
 
 # CRM
 app.include_router(crm.router,        prefix="/api/crm",  tags=["crm"])
 
-# IA (opcional; as regras no front não dependem disso)
+# IA (classificação automática de estágio)
 app.include_router(ai.router,         prefix="/api",      tags=["ai"])
-
-# Proxy de mídia (necessário para exibir imagens/vídeos/documentos no front)
-app.include_router(media.router,      prefix="/api",      tags=["media"])
