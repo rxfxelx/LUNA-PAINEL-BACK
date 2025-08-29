@@ -3,7 +3,6 @@ from __future__ import annotations
 import unicodedata
 from typing import Iterable
 
-# ===== helpers =====
 def _norm(s: str | None) -> str:
     s = (s or "").lower().strip()
     s = unicodedata.normalize("NFD", s)
@@ -11,11 +10,12 @@ def _norm(s: str | None) -> str:
     return " ".join(s.split())
 
 def _txt(m) -> str:
+    msg = m.get("message") or {}
     return _norm(
         m.get("text")
         or m.get("caption")
-        or (m.get("message") or {}).get("text")
-        or (m.get("message") or {}).get("conversation")
+        or msg.get("text")
+        or msg.get("conversation")
         or m.get("body")
         or ""
     )
@@ -23,7 +23,6 @@ def _txt(m) -> str:
 def _from_me(m) -> bool:
     return bool(m.get("fromMe") or m.get("fromme") or m.get("from_me"))
 
-# ===== regras (mesmas do front, adaptadas) =====
 HOT_HINTS = list(map(_norm, [
     "vou te passar para","vou te passar pro","vou passar voce para","vou passar você para",
     "vou passar para o setor","vou passar para o departamento","vou passar para o time",
@@ -65,7 +64,6 @@ LEAD_NAME_PATTERNS = list(map(_norm, [
     "ql seu nome","q seu nome","seu nm","seu nome sff","seu nome pf",
 ]))
 
-# Saídas compatíveis com o CRM: lead / lead_qualificado / lead_quente / prospectivo_cliente / cliente
 def classify_by_rules(messages: Iterable[dict]) -> str:
     stage = "lead"
     for m in messages or []:
@@ -74,12 +72,10 @@ def classify_by_rules(messages: Iterable[dict]) -> str:
         text = _txt(m)
         if not text:
             continue
-
         if any(g in text for g in HOT_NEGATIVE_GUARDS):
-            pass  # ignora "menu/cardápio"
+            pass
         elif any(h in text for h in HOT_HINTS):
             return "lead_quente"
-
         if any(p in text for p in LEAD_OK_PATTERNS) or any(p in text for p in LEAD_NAME_PATTERNS):
             stage = "lead_qualificado"
     return stage
