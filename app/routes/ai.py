@@ -1,13 +1,12 @@
 # app/routes/ai.py
 from __future__ import annotations
-from typing import Dict, List, Optional
-
+from typing import List
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.routes.deps import get_uazapi_ctx
 from app.core.stage_rules import classify_by_rules
-from app.routes import crm as crm_module  # para persistir
+from app.routes import crm as crm_module
 
 router = APIRouter()
 
@@ -28,16 +27,8 @@ async def _fetch_last_messages(ctx: dict, chatid: str, limit: int = 200) -> List
     return items or []
 
 @router.post("/stage/classify")
-async def classify_chat(
-    chatid: str,
-    persist: bool = True,
-    limit: int = 200,
-    ctx=Depends(get_uazapi_ctx),
-):
-    """
-    Classifica 1 chat pelas regras e (opcional) persiste no CRM.
-    """
-    msgs = await _fetch_last_messages(ctx, chatid, limit=limit)
+async def classify_chat(chatid: str, persist: bool = True, limit: int = 200, ctx=Depends(get_uazapi_ctx)):
+    msgs  = await _fetch_last_messages(ctx, chatid, limit=limit)
     stage = classify_by_rules(msgs)
     if persist:
         crm_module.set_status_internal(chatid, stage)
