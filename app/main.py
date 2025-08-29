@@ -50,8 +50,8 @@ app.include_router(name_image.router, prefix="/api",      tags=["name-image"])
 # CRM
 app.include_router(crm.router,        prefix="/api/crm",  tags=["crm"])
 
-# IA (classificação automática de estágio)
+# IA (se você já usa em outro fluxo)
 app.include_router(ai.router,         prefix="/api",      tags=["ai"])
 
-# MEDIA (proxy p/ imagens, vídeos, docs) — AGORA REGISTRADO
+# MEDIA (proxy p/ imagens, vídeos, docs)
 app.include_router(media.router,      prefix="/api/media", tags=["media"])
