@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import StreamingResponse
@@ -13,6 +14,10 @@ from app.routes import crm as crm_module
 
 router = APIRouter()
 
+# ---------------- cache simples p/ classificação ---------------- #
+_CLASSIFY_CACHE: dict[str, tuple[float, str]] = {}  # chatid -> (ts, stage)
+_CLASSIFY_TTL = 300  # 5 minutos
+
 
 def _uaz(ctx):
     base = f"https://{ctx['host']}"
@@ -21,9 +26,6 @@ def _uaz(ctx):
 
 
 def _normalize_items(resp_json):
-    """
-    Normaliza para sempre retornar {"items": [...]}.
-    """
     if isinstance(resp_json, dict):
         if isinstance(resp_json.get("items"), list):
             return {"items": resp_json["items"]}
@@ -38,18 +40,26 @@ def _normalize_items(resp_json):
 
 
 async def _classify_one(ctx: dict, chatid: str) -> str | None:
-    """
-    Usa o módulo /ai para classificar e persistir (CRM) um chat.
-    Retorna o stage ou None se falhar.
-    """
+    # cache
+    now = time.time()
+    hit = _CLASSIFY_CACHE.get(chatid)
+    if hit and now - hit[0] <= _CLASSIFY_TTL:
+        return hit[1]
+    # chama IA com timeout curto (não trava página)
     try:
-        res = await ai_routes.classify_chat(chatid=chatid, persist=True, limit=200, ctx=ctx)
-        return res.get("stage")
+        res = await asyncio.wait_for(
+            ai_routes.classify_chat(chatid=chatid, persist=True, limit=200, ctx=ctx),
+            timeout=3.0,
+        )
+        stage = (res or {}).get("stage")
+        if stage:
+            _CLASSIFY_CACHE[chatid] = (now, stage)
+        return stage
     except Exception:
         return None
 
 
-# ------------------ Resposta única (com paginação interna) ------------------ #
+# ------------------ Resposta única (paginada) ------------------ #
 @router.post("/chats")
 async def find_chats(
     body: dict | None = Body(None),
@@ -90,22 +100,14 @@ async def find_chats(
     items = items[:max_total]
 
     if classify and items:
-        sem = asyncio.Semaphore(8)
-
+        sem = asyncio.Semaphore(16)  # ↑ concorrência
         async def worker(item: dict):
-            chatid = (
-                item.get("wa_chatid")
-                or item.get("chatid")
-                or item.get("wa_fastid")
-                or item.get("id")
-                or ""
-            )
+            chatid = item.get("wa_chatid") or item.get("chatid") or item.get("wa_fastid") or item.get("id") or ""
             if not chatid:
                 return
             async with sem:
                 st = await _classify_one(ctx, chatid)
             if st:
-                # expõe nos dois campos para compatibilidade
                 item["_stage"] = st
                 item["stage"] = st
                 crm_module.set_status_internal(chatid, st)
@@ -115,7 +117,7 @@ async def find_chats(
     return {"items": items}
 
 
-# ------------------ Stream NDJSON (paginado + concorrente) ------------------ #
+# ------------------ Stream NDJSON ------------------ #
 @router.post("/chats/stream")
 async def stream_chats(
     body: dict | None = Body(None),
@@ -129,21 +131,12 @@ async def stream_chats(
     async def gen():
         count = 0
         offset = 0
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(16)  # ↑ concorrência
 
         async with httpx.AsyncClient(timeout=30) as cli:
 
             async def process_item(item: dict) -> str:
-                """
-                Classifica (concorrente) e devolve a linha NDJSON pronta.
-                """
-                chatid = (
-                    item.get("wa_chatid")
-                    or item.get("chatid")
-                    or item.get("wa_fastid")
-                    or item.get("id")
-                    or ""
-                )
+                chatid = item.get("wa_chatid") or item.get("chatid") or item.get("wa_fastid") or item.get("id") or ""
                 if chatid:
                     async with sem:
                         st = await _classify_one(ctx, chatid)
@@ -172,7 +165,6 @@ async def stream_chats(
                 if not chunk:
                     break
 
-                # dispara processamento concorrente e emite conforme finaliza
                 coros = [process_item(it) for it in chunk]
                 for fut in asyncio.as_completed(coros):
                     line = await fut
