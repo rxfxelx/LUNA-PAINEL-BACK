@@ -1,56 +1,82 @@
-# app/routes/messages.py
-from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+import io, re, httpx
+from typing import Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from starlette.responses import StreamingResponse
 
-from app.core.stage import classify_and_cache
+from app.routes.deps import get_uazapi_ctx
+from app.routes.ai import classify_by_rules
 
 router = APIRouter()
 
-# ====== MODELOS DE I/O (mantenha compatível com o que já existia) ======
-class MessagesQuery(BaseModel):
-    chatid: str
-    limit: Optional[int] = 200
-    offset: Optional[int] = 0
-    sort: Optional[str] = "-messageTimestamp"
+def _uaz(ctx):
+    base = f"https://{ctx['host']}"
+    headers = {"token": ctx["token"]}
+    return base, headers
 
-# ATENÇÃO:
-# Troque esta função para usar a sua camada real de dados.
-# Aqui está um placeholder que você já deve ter no seu projeto.
-async def _fetch_messages_from_store(chatid: str, limit: int, offset: int, sort: str) -> List[Dict[str, Any]]:
-    """
-    Implemente de acordo com seu storage (Mongo/SQL/etc).
-    Deve retornar a MESMA estrutura que o endpoint já retornava.
-    """
-    raise HTTPException(status_code=500, detail="Data layer não implementada aqui")
+def _pick(d: Dict[str, Any], path: str, default=None):
+    cur = d
+    for p in path.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(p)
+    return cur if cur is not None else default
 
-@router.post("/messages")
-async def list_messages(payload: MessagesQuery):
-    """
-    Retorna mensagens e JÁ inclui 'stage' calculado no servidor,
-    para que a classificação fique instantânea no front.
-    """
-    try:
-        items = await _fetch_messages_from_store(
-            chatid=payload.chatid,
-            limit=payload.limit or 200,
-            offset=payload.offset or 0,
-            sort=payload.sort or "-messageTimestamp",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar mensagens: {e}")
+@router.get("/proxy")
+async def media_proxy(u: str = Query(...)):
+    if not re.match(r"^https?://", u):
+        raise HTTPException(400, "URL inválida")
+    async with httpx.AsyncClient(timeout=30) as cli:
+        r = await cli.get(u)
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, "Falha ao baixar mídia")
+    ct = r.headers.get("content-type", "application/octet-stream")
+    return StreamingResponse(io.BytesIO(r.content), media_type=ct)
 
-    # ---- CLASSIFICA AQUI, ANTES DE RESPONDER ----
-    try:
-        stage, last_key = classify_and_cache(payload.chatid, items or [])
-    except Exception as e:
-        # mesmo que falhe a classificação, não bloqueia retorno das mensagens
-        stage, last_key = "contatos", "error"
+@router.post("/resolve")
+async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uazapi_ctx)):
+    m = payload or {}
+    mime = ( m.get("mimetype") or m.get("mime") or
+             _pick(m,"message.imageMessage.mimetype") or
+             _pick(m,"message.videoMessage.mimetype") or
+             _pick(m,"message.documentMessage.mimetype") or
+             _pick(m,"message.audioMessage.mimetype") or
+             _pick(m,"message.stickerMessage.mimetype") or "" )
+    url = ( m.get("mediaUrl") or m.get("url") or m.get("fileUrl") or m.get("downloadUrl") or
+            m.get("image") or m.get("video") or
+            _pick(m,"message.imageMessage.url") or _pick(m,"message.videoMessage.url") or
+            _pick(m,"message.documentMessage.url") or _pick(m,"message.audioMessage.url") or
+            _pick(m,"message.stickerMessage.url") or "" )
+    data_url = ( m.get("dataUrl") or _pick(m,"message.imageMessage.dataUrl") or
+                 _pick(m,"message.videoMessage.dataUrl") or _pick(m,"message.stickerMessage.dataUrl") or "" )
+    if url or data_url:
+        return {"url": url, "mime": mime, "dataUrl": data_url}
 
-    return {
-        "items": items or [],
-        "stage": stage,          # <<< novo
-        "stage_last_key": last_key,
-    }
+    media_id = ( m.get("mediaId") or _pick(m,"message.documentMessage.mediaKey") or
+                 _pick(m,"message.imageMessage.mediaKey") or _pick(m,"message.videoMessage.mediaKey") or
+                 _pick(m,"message.audioMessage.mediaKey") or _pick(m,"message.stickerMessage.mediaKey") or None )
+
+    base, headers = _uaz(ctx)
+    async with httpx.AsyncClient(timeout=30) as cli:
+        candidates = []
+        if media_id:
+            candidates.append(("GET", f"{base}/media/resolve?id={media_id}", None))
+        candidates.append(("POST", f"{base}/media/resolve", {"message": m}))
+        for method, url2, body in candidates:
+            r = await (cli.post(url2, headers=headers, json=body) if method == "POST" else cli.get(url2, headers=headers))
+            if 200 <= r.status_code < 300:
+                try:
+                    j = r.json()
+                except Exception:
+                    continue
+                u = j.get("url") or j.get("downloadUrl")
+                mm = j.get("mime") or j.get("mimetype") or mime
+                d = j.get("dataUrl") or ""
+                if u or d:
+                    return {"url": u, "mime": mm, "dataUrl": d}
+
+    raise HTTPException(404, "Não foi possível resolver a mídia")
+
+@router.post("/stage/classify")
+async def stage_classify(payload: Dict[str, Any] = Body(...)):
+    items = payload.get("messages") or []
+    return {"stage": classify_by_rules(items)}
