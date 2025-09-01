@@ -1,6 +1,8 @@
 # app/routes/chats.py
 from __future__ import annotations
-import asyncio, json
+
+import asyncio
+import json
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import StreamingResponse
@@ -11,12 +13,17 @@ from app.routes import crm as crm_module
 
 router = APIRouter()
 
+
 def _uaz(ctx):
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
     return base, headers
 
+
 def _normalize_items(resp_json):
+    """
+    Normaliza para sempre retornar {"items": [...]}.
+    """
     if isinstance(resp_json, dict):
         if isinstance(resp_json.get("items"), list):
             return {"items": resp_json["items"]}
@@ -29,14 +36,20 @@ def _normalize_items(resp_json):
         return {"items": resp_json}
     return {"items": []}
 
+
 async def _classify_one(ctx: dict, chatid: str) -> str | None:
+    """
+    Usa o módulo /ai para classificar e persistir (CRM) um chat.
+    Retorna o stage ou None se falhar.
+    """
     try:
         res = await ai_routes.classify_chat(chatid=chatid, persist=True, limit=200, ctx=ctx)
-        return res["stage"]
+        return res.get("stage")
     except Exception:
         return None
 
-# -------- resposta única (paginando) --------
+
+# ------------------ Resposta única (com paginação interna) ------------------ #
 @router.post("/chats")
 async def find_chats(
     body: dict | None = Body(None),
@@ -50,44 +63,59 @@ async def find_chats(
 
     items: list[dict] = []
     offset = 0
-    while len(items) < max_total:
-        payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
-        payload = {**payload, "limit": page_size, "offset": offset}
-        async with httpx.AsyncClient(timeout=30) as cli:
-            r = await cli.post(url, json=payload, headers=headers)
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        try:
-            data = r.json()
-        except Exception:
-            raise HTTPException(502, "Resposta inválida da UAZAPI em /chat/find")
 
-        chunk = _normalize_items(data)["items"]
-        if not chunk:
-            break
-        items.extend(chunk)
-        if len(chunk) < page_size:
-            break
-        offset += page_size
+    async with httpx.AsyncClient(timeout=30) as cli:
+        while len(items) < max_total:
+            payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+            payload = {**payload, "limit": page_size, "offset": offset}
+
+            r = await cli.post(url, json=payload, headers=headers)
+            if r.status_code >= 400:
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+
+            try:
+                data = r.json()
+            except Exception:
+                raise HTTPException(502, "Resposta inválida da UAZAPI em /chat/find")
+
+            chunk = _normalize_items(data)["items"]
+            if not chunk:
+                break
+
+            items.extend(chunk)
+            if len(chunk) < page_size:
+                break
+            offset += page_size
 
     items = items[:max_total]
 
     if classify and items:
         sem = asyncio.Semaphore(8)
-        async def worker(item):
-            chatid = item.get("wa_chatid") or item.get("chatid") or item.get("wa_fastid") or item.get("id")
-            if not chatid: 
+
+        async def worker(item: dict):
+            chatid = (
+                item.get("wa_chatid")
+                or item.get("chatid")
+                or item.get("wa_fastid")
+                or item.get("id")
+                or ""
+            )
+            if not chatid:
                 return
             async with sem:
                 st = await _classify_one(ctx, chatid)
-                if st:
-                    item["_stage"] = st
-                    crm_module.set_status_internal(chatid, st)
+            if st:
+                # expõe nos dois campos para compatibilidade
+                item["_stage"] = st
+                item["stage"] = st
+                crm_module.set_status_internal(chatid, st)
+
         await asyncio.gather(*(worker(it) for it in items))
 
     return {"items": items}
 
-# -------- stream ao vivo (NDJSON + paginação) --------
+
+# ------------------ Stream NDJSON (paginado + concorrente) ------------------ #
 @router.post("/chats/stream")
 async def stream_chats(
     body: dict | None = Body(None),
@@ -103,44 +131,58 @@ async def stream_chats(
         offset = 0
         sem = asyncio.Semaphore(8)
 
-        async def enrich_and_dump(item):
-            chatid = item.get("wa_chatid") or item.get("chatid") or item.get("wa_fastid") or item.get("id")
-            if chatid:
-                async with sem:
-                    st = await _classify_one(ctx, chatid)
+        async with httpx.AsyncClient(timeout=30) as cli:
+
+            async def process_item(item: dict) -> str:
+                """
+                Classifica (concorrente) e devolve a linha NDJSON pronta.
+                """
+                chatid = (
+                    item.get("wa_chatid")
+                    or item.get("chatid")
+                    or item.get("wa_fastid")
+                    or item.get("id")
+                    or ""
+                )
+                if chatid:
+                    async with sem:
+                        st = await _classify_one(ctx, chatid)
                     if st:
                         item["_stage"] = st
+                        item["stage"] = st
                         crm_module.set_status_internal(chatid, st)
-            yield json.dumps(item, ensure_ascii=False) + "\n"
+                return json.dumps(item, ensure_ascii=False) + "\n"
 
-        while count < max_total:
-            payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
-            payload = {**payload, "limit": page_size, "offset": offset}
-            async with httpx.AsyncClient(timeout=30) as cli:
+            while count < max_total:
+                payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+                payload = {**payload, "limit": page_size, "offset": offset}
+
                 r = await cli.post(url, json=payload, headers=headers)
-            if r.status_code >= 400:
-                yield json.dumps({"error": r.text}) + "\n"
-                return
-            try:
-                data = r.json()
-            except Exception:
-                yield json.dumps({"error": "Resposta inválida da UAZAPI"}) + "\n"
-                return
+                if r.status_code >= 400:
+                    yield json.dumps({"error": r.text}) + "\n"
+                    return
 
-            chunk = _normalize_items(data)["items"]
-            if not chunk:
-                break
+                try:
+                    data = r.json()
+                except Exception:
+                    yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\n"
+                    return
 
-            tasks = [enrich_and_dump(it) for it in chunk]
-            for coro in asyncio.as_completed(tasks):
-                async for line in coro:
+                chunk = _normalize_items(data)["items"]
+                if not chunk:
+                    break
+
+                # dispara processamento concorrente e emite conforme finaliza
+                coros = [process_item(it) for it in chunk]
+                for fut in asyncio.as_completed(coros):
+                    line = await fut
                     yield line
                     count += 1
                     if count >= max_total:
                         break
 
-            if len(chunk) < page_size or count >= max_total:
-                break
-            offset += page_size
+                if len(chunk) < page_size or count >= max_total:
+                    break
+                offset += page_size
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
