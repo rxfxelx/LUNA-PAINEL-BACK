@@ -14,17 +14,15 @@ from starlette.responses import StreamingResponse
 from app.routes.deps import get_uazapi_ctx
 from app.routes.ai import classify_by_rules
 
-# cache/serviço de lead status (sincrono, conforme seu módulo)
+# services (assíncronos!)
 from app.services.lead_status import (
     getCachedLeadStatus,
     upsertLeadStatus,
     needsReclassify,
 )
 
-# ---------- Router com prefixo p/ alinhar com o front (/api/media/...) ----------
 router = APIRouter(prefix="/api/media", tags=["media"])
 
-# ---------------- utils ----------------
 def _uaz(ctx):
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
@@ -43,17 +41,12 @@ def _b64url_to_bytes(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + pad)
 
 def _get_instance_id_from_request(req: Request) -> str:
-    # 1) state
     inst = getattr(req.state, "instance_id", None)
     if inst:
         return str(inst)
-
-    # 2) header explícito
     h = req.headers.get("x-instance-id")
     if h:
         return str(h)
-
-    # 3) JWT Bearer
     auth = req.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
@@ -72,7 +65,6 @@ def _get_instance_id_from_request(req: Request) -> str:
                 pass
     return ""
 
-# ---------------- media proxy/resolve ----------------
 @router.get("/proxy")
 async def media_proxy(u: str = Query(..., alias="u")):
     if not re.match(r"^https?://", u):
@@ -153,7 +145,6 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
 
     raise HTTPException(404, "Não foi possível resolver a mídia")
 
-# ---------------- Classificação com cache ----------------
 def _ts(m: Dict[str, Any]) -> int:
     return int(
         m.get("messageTimestamp")
@@ -176,9 +167,6 @@ def _from_me(m: Dict[str, Any]) -> bool:
 async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     payload: { chatid?: str, messages: [...] }
-    - Lê instance_id do JWT/headers
-    - Usa cache (DB/mem) se não precisar reclassificar
-    - Caso precise, classifica, persiste e retorna
     """
     instance_id = _get_instance_id_from_request(request)
     if not instance_id:
@@ -191,8 +179,9 @@ async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     last_ts = _ts(last) if last else 0
     last_from_me = _from_me(last) if last else False
 
-    if chatid and not needsReclassify(instance_id, chatid, last_ts, last_from_me):
-        cached = getCachedLeadStatus(instance_id, chatid)
+    # 👇 **agora com await**
+    if chatid and not await needsReclassify(instance_id, chatid, last_ts, last_from_me):
+        cached = await getCachedLeadStatus(instance_id, chatid)
         if cached:
             return {
                 "stage": cached["stage"],
@@ -203,7 +192,7 @@ async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     stage = classify_by_rules(items) or "contatos"
 
     if chatid:
-        rec = upsertLeadStatus(
+        rec = await upsertLeadStatus(
             instance_id=instance_id,
             chatid=chatid,
             stage=stage,
