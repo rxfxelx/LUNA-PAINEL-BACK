@@ -41,7 +41,10 @@ async def _startup():
     logger = logging.getLogger("uvicorn")
     logger.info("Luna Backend iniciado")
     # garante tabela lead_status
-    init_schema()
+    try:
+        init_schema()
+    except Exception as e:
+        logger.warning("Falha ao inicializar schema lead_status: %s", e)
 
 # Auth
 app.include_router(auth_router,           prefix="/api/auth",   tags=["auth"])
