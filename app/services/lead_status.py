@@ -1,17 +1,7 @@
 # app/services/lead_status.py
 from __future__ import annotations
 from typing import Iterable, List, Optional, Dict, Any
-from datetime import datetime, timezone
-
 from app.pg import get_pool
-
-# Tabela:
-# lead_status(
-#   instance_id TEXT, chatid TEXT,
-#   stage TEXT, updated_at TIMESTAMPTZ,
-#   last_msg_ts BIGINT, last_from_me BOOLEAN,
-#   PRIMARY KEY(instance_id, chatid)
-# )
 
 def _row_to_dict(row) -> Dict[str, Any]:
     if not row:
@@ -62,7 +52,6 @@ async def upsert_lead_status(
     last_msg_ts: int = 0,
     last_from_me: bool = False,
 ) -> Dict[str, Any]:
-    # normaliza
     s = (stage or "").strip().lower()
     if s.startswith("contato"):
         s = "contatos"
@@ -95,11 +84,6 @@ async def should_reclassify(
     last_msg_ts: Optional[int] = None,
     last_from_me: Optional[bool] = None,
 ) -> bool:
-    """
-    - Reclassifica se não existir registro
-    - Reclassifica se chegou msg com timestamp maior
-    - Reclassifica se mudou a autoria do último
-    """
     cur = await get_lead_status(instance_id, chatid)
     if not cur:
         return True
@@ -109,9 +93,7 @@ async def should_reclassify(
         return True
     return False
 
-# -------- Aliases para compatibilidade com os imports existentes --------
-# (mesma assinatura, só encaminham para as funções acima)
-
+# -------- Aliases de compatibilidade (mantém imports antigos) --------
 async def getCachedLeadStatus(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
     return await get_lead_status(instance_id, chatid)
 
@@ -133,8 +115,6 @@ async def needsReclassify(
     return await should_reclassify(instance_id, chatid, last_msg_ts, last_from_me)
 
 __all__ = [
-    # oficiais
     "get_lead_status", "get_many_lead_status", "upsert_lead_status", "should_reclassify",
-    # compat
     "getCachedLeadStatus", "upsertLeadStatus", "needsReclassify",
 ]
