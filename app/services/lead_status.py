@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
-from app.pg import get_pool  # usa o pool (get_conn não existe mais)
+from app.pg import get_pool
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -72,3 +72,28 @@ def upsertLeadStatus(
             "last_msg_ts": int(row[4] or 0),
             "last_from_me": bool(row[5]),
         }
+
+
+def needsReclassify(
+    cached: Optional[Dict[str, Any]],
+    observed_last_ts: Optional[int] = None,
+    observed_from_me: Optional[bool] = None,
+) -> bool:
+    """
+    Decide se precisamos reclassificar.
+    Regra simples (compatível com usos típicos no media.py):
+      - Se não há cache => True
+      - Se o timestamp observado é mais recente que o do cache => True
+      - Caso contrário => False
+    """
+    if not cached:
+        return True
+    try:
+        cached_ts = int(cached.get("last_msg_ts") or 0)
+        obs_ts = int(observed_last_ts or 0)
+        if obs_ts > cached_ts:
+            return True
+    except Exception:
+        # se algo der ruim ao parsear, força reclassificação para segurança
+        return True
+    return False
