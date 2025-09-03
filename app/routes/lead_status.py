@@ -8,6 +8,12 @@ router = APIRouter()
 
 @router.get("/lead-status")
 async def get_one(chatid: str = Query(...)):
+    """
+    Retorna um único registro de cache.
+    Resposta:
+      { found: false }  ou
+      { found: true, chatid, stage, last_msg_ts, updated_at, last_from_me }
+    """
     rec = getCachedLeadStatus(chatid)
     if not rec:
         return {"found": False}
@@ -15,12 +21,22 @@ async def get_one(chatid: str = Query(...)):
 
 @router.post("/lead-status/bulk")
 async def get_bulk(payload: Dict[str, Any] = Body(...)):
-    chatids: List[str] = payload.get("chatids") or []
-    if not isinstance(chatids, list) or not all(isinstance(c, str) for c in chatids):
-        raise HTTPException(400, "chatids inválido")
-    out = []
-    for cid in chatids:
+    """
+    Busca em lote. Aceita { ids: string[] } ou { chatids: string[] }.
+    Resposta no formato que o front espera:
+      { items: { "<chatid>": { stage, last_msg_ts } } }
+    """
+    ids: List[str] = payload.get("ids") or payload.get("chatids") or []
+    if not isinstance(ids, list) or not all(isinstance(c, str) and c for c in ids):
+        raise HTTPException(status_code=400, detail="ids/chatids inválido")
+
+    items: Dict[str, Dict[str, Any]] = {}
+    for cid in ids:
         rec = getCachedLeadStatus(cid)
         if rec:
-            out.append(rec)
-    return {"items": out}
+            items[rec["chatid"]] = {
+                "stage": rec.get("stage"),
+                "last_msg_ts": int(rec.get("last_msg_ts") or 0),
+            }
+
+    return {"items": items}
