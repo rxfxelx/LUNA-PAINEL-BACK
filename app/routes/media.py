@@ -1,12 +1,12 @@
 import io, re, httpx
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from starlette.responses import StreamingResponse
 
 from app.routes.deps import get_uazapi_ctx
 from app.routes.ai import classify_by_rules
 
-# cache de classificação
+# cache de classificação (assinaturas com instance_id)
 from app.services.lead_status import (
     getCachedLeadStatus,
     upsertLeadStatus,
@@ -15,6 +15,7 @@ from app.services.lead_status import (
 
 router = APIRouter()
 
+# ---------------- utils ----------------
 def _uaz(ctx):
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
@@ -28,6 +29,40 @@ def _pick(d: Dict[str, Any], path: str, default=None):
         cur = cur.get(p)
     return cur if cur is not None else default
 
+def _b64url_to_bytes(s: str) -> bytes:
+    import base64
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+def _get_instance_id_from_request(req: Request) -> str:
+    inst = getattr(req.state, "instance_id", None)
+    if inst:
+        return str(inst)
+
+    h = req.headers.get("x-instance-id")
+    if h:
+        return str(h)
+
+    auth = req.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        parts = token.split(".")
+        if len(parts) >= 2:
+            import json
+            try:
+                payload = json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
+                return str(
+                    payload.get("instance_id")
+                    or payload.get("phone_number_id")
+                    or payload.get("pnid")
+                    or payload.get("sub")
+                    or ""
+                )
+            except Exception:
+                pass
+    return ""
+
+# ---------------- media proxy/resolve ----------------
 @router.get("/proxy")
 async def media_proxy(u: str = Query(...)):
     if not re.match(r"^https?://", u):
@@ -83,7 +118,7 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
 
     raise HTTPException(404, "Não foi possível resolver a mídia")
 
-# ---------- Classificação com cache ----------
+# ---------------- Classificação com cache ----------------
 def _ts(m: Dict[str, Any]) -> int:
     return int(
         m.get("messageTimestamp")
@@ -102,23 +137,42 @@ def _from_me(m: Dict[str, Any]) -> bool:
     )
 
 @router.post("/stage/classify")
-async def stage_classify(payload: Dict[str, Any] = Body(...)):
-    # payload esperado: { chatid?: str, messages: [...] }
+async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
+    """
+    payload: { chatid?: str, messages: [...] }
+    - Lê instance_id do JWT
+    - Usa cache (DB) se não precisar reclassificar
+    - Caso precise, classifica, persiste e retorna
+    """
+    instance_id = _get_instance_id_from_request(request)
+    if not instance_id:
+        raise HTTPException(401, "JWT sem instance_id")
+
     chatid = str(payload.get("chatid") or "").strip()
-    items = payload.get("messages") or []
+    items: List[Dict[str, Any]] = payload.get("messages") or []
 
     last = max(items, key=_ts) if items else None
     last_ts = _ts(last) if last else 0
     last_from_me = _from_me(last) if last else False
 
-    # Se temos chatid e não há mensagem mais nova, devolve cache
-    if chatid and not needsReclassify(chatid, last_ts, last_from_me):
-        cached = getCachedLeadStatus(chatid)
+    # cache: se não precisa reclassificar, devolve do banco
+    if chatid and not needsReclassify(instance_id, chatid, last_ts, last_from_me):
+        cached = getCachedLeadStatus(instance_id, chatid)
         if cached:
-            return {"stage": cached["stage"], "cached": True}
+            return {"stage": cached["stage"], "cached": True, "last_msg_ts": cached.get("last_msg_ts", 0)}
 
-    # Caso contrário, classifica pelas regras existentes e atualiza cache
-    stage = classify_by_rules(items)
+    # classifica pelas regras atuais
+    stage = classify_by_rules(items) or "contatos"
+
+    # persiste no cache por instância
     if chatid:
-        upsertLeadStatus(chatid, stage=stage, last_msg_ts=last_ts, last_from_me=last_from_me)
-    return {"stage": stage, "cached": False}
+        rec = upsertLeadStatus(
+            instance_id=instance_id,
+            chatid=chatid,
+            stage=stage,
+            last_msg_ts=last_ts,
+            last_from_me=last_from_me,
+        )
+        return {"stage": rec["stage"], "cached": False, "last_msg_ts": rec.get("last_msg_ts", last_ts)}
+
+    return {"stage": stage, "cached": False, "last_msg_ts": last_ts}
