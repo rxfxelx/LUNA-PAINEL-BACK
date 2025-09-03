@@ -3,15 +3,25 @@ from psycopg_pool import ConnectionPool
 
 _pool = None
 
+
 def get_pool() -> ConnectionPool:
+    """
+    Cria (singleton) um pool de conexões.
+    - Usa configure para ligar autocommit de forma correta.
+    """
     global _pool
     if _pool is None:
         dsn = os.getenv("DATABASE_URL")
         if not dsn:
             raise RuntimeError("DATABASE_URL não definido no ambiente em runtime")
         size = int(os.getenv("PGPOOL_SIZE", "5"))
-        _pool = ConnectionPool(conninfo=dsn, max_size=size, kwargs={"autocommit": True})
+
+        def _configure(conn):
+            conn.autocommit = True
+
+        _pool = ConnectionPool(conninfo=dsn, max_size=size, configure=_configure)
     return _pool
+
 
 def init_schema():
     """
@@ -36,7 +46,8 @@ def init_schema():
     DO $$
     BEGIN
       IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
+        SELECT 1
+        FROM information_schema.columns
         WHERE table_name = 'lead_status' AND column_name = 'instance_id'
       ) THEN
         ALTER TABLE lead_status ADD COLUMN instance_id TEXT;
@@ -44,49 +55,31 @@ def init_schema():
     END$$;
 
     -- backfill: se veio de schema antigo, garante valor para instance_id
-    UPDATE lead_status SET instance_id = COALESCE(instance_id, 'legacy') WHERE instance_id IS NULL;
+    UPDATE lead_status
+       SET instance_id = COALESCE(instance_id, 'legacy')
+     WHERE instance_id IS NULL;
 
-    -- garante colunas antigas (idempotente)
+    -- garante defaults (idempotente)
     ALTER TABLE lead_status
       ALTER COLUMN stage SET DEFAULT 'contatos',
       ALTER COLUMN updated_at SET DEFAULT NOW(),
       ALTER COLUMN last_msg_ts SET DEFAULT 0,
       ALTER COLUMN last_from_me SET DEFAULT FALSE;
 
-    -- migração da PK: troca PK antiga (somente chatid) pela composta
+    -- migração da PK: ajusta para (instance_id, chatid)
     DO $$
-    DECLARE
-      has_pkey BOOLEAN;
     BEGIN
-      SELECT TRUE
-      FROM pg_constraint
-      WHERE conrelid = 'lead_status'::regclass
-        AND contype = 'p'
-        AND conkey::text IN (
-          -- pk só chatid
-          (SELECT array_agg(attnum)::text
-             FROM pg_attribute
-             WHERE attrelid = 'lead_status'::regclass
-               AND attname IN ('chatid')
-               AND attnum > 0),
-          -- pk composta correta
-          (SELECT array_agg(attnum)::text
-             FROM pg_attribute
-             WHERE attrelid = 'lead_status'::regclass
-               AND attname IN ('instance_id','chatid')
-               AND attnum > 0)
-        )
-      INTO has_pkey;
-
-      -- sempre dropar a PK e recriar a correta (idempotente)
-      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'lead_status'::regclass AND contype='p') THEN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'lead_status'::regclass AND contype = 'p'
+      ) THEN
         ALTER TABLE lead_status DROP CONSTRAINT IF EXISTS lead_status_pkey;
       END IF;
 
+      -- pode falhar se houver linhas sem instance_id (tratado pelo backfill acima)
       BEGIN
         ALTER TABLE lead_status ALTER COLUMN instance_id SET NOT NULL;
       EXCEPTION WHEN others THEN
-        -- se tiver registros nulos que não deu pra backfill, mantém sem NOT NULL
         NULL;
       END;
 
