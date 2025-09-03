@@ -1,40 +1,72 @@
+# app/services/lead_status.py
 from __future__ import annotations
 from typing import Optional, Dict, Any
-from app.pg import get_pool
+from app.pg import get_conn  # use o seu helper de conexão
 
-def _row_to_dict(r) -> Dict[str, Any]:
-    return {
-        "chatid": r[0],
-        "stage": r[1],
-        "updated_at": r[2].isoformat() if r[2] else None,
-        "last_msg_ts": int(r[3]) if r[3] is not None else 0,
-        "last_from_me": bool(r[4]) if r[4] is not None else False,
-    }
+TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS lead_status (
+  instance_id TEXT NOT NULL,
+  chatid      TEXT NOT NULL,
+  stage       TEXT,
+  last_msg_ts BIGINT DEFAULT 0,
+  updated_at  TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (instance_id, chatid)
+);
+-- migrações idempotentes (caso a tabela já existisse sem instance_id)
+ALTER TABLE lead_status ADD COLUMN IF NOT EXISTS instance_id TEXT;
+ALTER TABLE lead_status DROP CONSTRAINT IF EXISTS lead_status_pkey;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE tablename = 'lead_status' AND indexname = 'lead_status_pkey'
+  ) THEN
+    BEGIN
+      ALTER TABLE lead_status ADD PRIMARY KEY (instance_id, chatid);
+    EXCEPTION WHEN others THEN
+      -- no-op
+      NULL;
+    END;
+  END IF;
+END$$;
+"""
 
-def getCachedLeadStatus(chatid: str) -> Optional[Dict[str, Any]]:
-    sql = "SELECT chatid, stage, updated_at, last_msg_ts, last_from_me FROM lead_status WHERE chatid = %s"
-    with get_pool().connection() as con:
-        row = con.execute(sql, (chatid,)).fetchone()
-    return _row_to_dict(row) if row else None
+def ensure_table():
+    with get_conn() as cur:
+        cur.execute(TABLE_SQL)
 
-def upsertLeadStatus(chatid: str, *, stage: str | None, last_msg_ts: int | None, last_from_me: bool | None) -> Dict[str, Any]:
-    sql = """
-    INSERT INTO lead_status (chatid, stage, last_msg_ts, last_from_me)
-    VALUES (%s, COALESCE(%s, 'contatos'), COALESCE(%s, 0), COALESCE(%s, FALSE))
-    ON CONFLICT (chatid) DO UPDATE SET
-        stage        = COALESCE(EXCLUDED.stage, lead_status.stage),
-        last_msg_ts  = COALESCE(EXCLUDED.last_msg_ts, lead_status.last_msg_ts),
-        last_from_me = COALESCE(EXCLUDED.last_from_me, lead_status.last_from_me),
-        updated_at   = NOW()
-    RETURNING chatid, stage, updated_at, last_msg_ts, last_from_me
-    """
-    with get_pool().connection() as con:
-        row = con.execute(sql, (chatid, stage, last_msg_ts, last_from_me)).fetchone()
-    return _row_to_dict(row)
+def getCachedLeadStatus(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
+    ensure_table()
+    with get_conn() as cur:
+        cur.execute(
+            "SELECT instance_id, chatid, stage, last_msg_ts, updated_at "
+            "FROM lead_status WHERE instance_id=%s AND chatid=%s",
+            (instance_id, chatid),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "instance_id": row[0],
+            "chatid": row[1],
+            "stage": row[2],
+            "last_msg_ts": int(row[3] or 0),
+            "updated_at": row[4],
+        }
 
-def needsReclassify(chatid: str, new_last_msg_ts: int, new_last_from_me: bool) -> bool:
-    cur = getCachedLeadStatus(chatid)
-    if not cur:
-        return True
-    cur_ts = int(cur.get("last_msg_ts") or 0)
-    return int(new_last_msg_ts or 0) > cur_ts
+def upsertLeadStatus(instance_id: str, chatid: str, stage: str, last_msg_ts: int):
+    ensure_table()
+    with get_conn() as cur:
+        cur.execute(
+            """
+            INSERT INTO lead_status (instance_id, chatid, stage, last_msg_ts)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (instance_id, chatid)
+            DO UPDATE SET
+              stage = EXCLUDED.stage,
+              last_msg_ts = GREATEST(lead_status.last_msg_ts, EXCLUDED.last_msg_ts),
+              updated_at = now()
+            """,
+            (instance_id, chatid, stage, int(last_msg_ts or 0)),
+        )
