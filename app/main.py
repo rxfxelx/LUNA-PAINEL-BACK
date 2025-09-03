@@ -4,7 +4,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# rotas internas
+# Rotas internas
 from .routes import (
     chats,
     messages,
@@ -20,11 +20,13 @@ from .routes import (
 from .auth import router as auth_router  # /api/auth/login, /api/auth/check, /api/auth/debug
 from .pg import init_schema
 
+
 def allowed_origins():
     raw = (os.getenv("FRONTEND_ORIGIN") or "*").strip()
     if not raw or raw == "*":
         return ["*"]
     return [o.strip() for o in raw.split(",") if o.strip()]
+
 
 app = FastAPI(title="Luna Backend", version="1.0.0")
 
@@ -36,15 +38,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.on_event("startup")
 async def _startup():
-    logger = logging.getLogger("uvicorn")
-    logger.info("Luna Backend iniciado")
-    # garante tabela lead_status
+    logger = logging.getLogger("uvicorn.error")
+    logger.info("Inicializando Luna Backend...")
+
+    db_url = os.getenv("DATABASE_URL") or ""
+    if not db_url:
+        logger.error("DATABASE_URL não definido! Defina a variável de ambiente para conectar ao Postgres.")
+    else:
+        # evita logar credenciais
+        safe_db = db_url.split("@")[-1]
+        logger.info("DATABASE_URL detectado (host/db: %s)", safe_db)
+
     try:
         init_schema()
-    except Exception as e:
-        logger.warning("Falha ao inicializar schema lead_status: %s", e)
+        logger.info("Schema 'lead_status' verificado/criado com sucesso.")
+    except Exception:
+        logger.exception("Falha ao inicializar schema do banco.")
+
 
 # Auth
 app.include_router(auth_router,           prefix="/api/auth",   tags=["auth"])
