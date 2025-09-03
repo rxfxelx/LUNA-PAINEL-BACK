@@ -1,11 +1,11 @@
 # app/services/lead_status.py
 from __future__ import annotations
-from typing import Iterable, List, Optional, Dict, Any, Tuple
+from typing import Iterable, List, Optional, Dict, Any
 from datetime import datetime, timezone
 
 from app.pg import get_pool
 
-# Tabela (vide app/pg.py):
+# Tabela:
 # lead_status(
 #   instance_id TEXT, chatid TEXT,
 #   stage TEXT, updated_at TIMESTAMPTZ,
@@ -13,7 +13,7 @@ from app.pg import get_pool
 #   PRIMARY KEY(instance_id, chatid)
 # )
 
-async def _row_to_dict(row) -> Dict[str, Any]:
+def _row_to_dict(row) -> Dict[str, Any]:
     if not row:
         return {}
     return {
@@ -25,6 +25,7 @@ async def _row_to_dict(row) -> Dict[str, Any]:
         "last_from_me": bool(row["last_from_me"]),
     }
 
+# -------- API assíncrona "oficial" --------
 async def get_lead_status(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
     pool = await get_pool()
     async with pool.acquire() as con:
@@ -36,7 +37,7 @@ async def get_lead_status(instance_id: str, chatid: str) -> Optional[Dict[str, A
             """,
             instance_id, chatid,
         )
-    return await _row_to_dict(row) if row else None
+    return _row_to_dict(row) if row else None
 
 async def get_many_lead_status(instance_id: str, chatids: Iterable[str]) -> List[Dict[str, Any]]:
     ids = [c for c in set(chatids) if c]
@@ -52,10 +53,7 @@ async def get_many_lead_status(instance_id: str, chatids: Iterable[str]) -> List
             """,
             instance_id, ids,
         )
-    out = []
-    for r in rows:
-        out.append(await _row_to_dict(r))
-    return out
+    return [_row_to_dict(r) for r in rows]
 
 async def upsert_lead_status(
     instance_id: str,
@@ -89,7 +87,7 @@ async def upsert_lead_status(
             """,
             instance_id, chatid, s, int(last_msg_ts or 0), bool(last_from_me),
         )
-    return await _row_to_dict(row)
+    return _row_to_dict(row)
 
 async def should_reclassify(
     instance_id: str,
@@ -97,10 +95,10 @@ async def should_reclassify(
     last_msg_ts: Optional[int] = None,
     last_from_me: Optional[bool] = None,
 ) -> bool:
-    """Heurística simples:
+    """
     - Reclassifica se não existir registro
     - Reclassifica se chegou msg com timestamp maior
-    - Reclassifica se mudou a autoria (ex.: antes era 'me', agora é do cliente)
+    - Reclassifica se mudou a autoria do último
     """
     cur = await get_lead_status(instance_id, chatid)
     if not cur:
@@ -110,3 +108,33 @@ async def should_reclassify(
     if last_from_me is not None and bool(last_from_me) != bool(cur.get("last_from_me")):
         return True
     return False
+
+# -------- Aliases para compatibilidade com os imports existentes --------
+# (mesma assinatura, só encaminham para as funções acima)
+
+async def getCachedLeadStatus(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
+    return await get_lead_status(instance_id, chatid)
+
+async def upsertLeadStatus(
+    instance_id: str,
+    chatid: str,
+    stage: str,
+    last_msg_ts: int = 0,
+    last_from_me: bool = False,
+) -> Dict[str, Any]:
+    return await upsert_lead_status(instance_id, chatid, stage, last_msg_ts, last_from_me)
+
+async def needsReclassify(
+    instance_id: str,
+    chatid: str,
+    last_msg_ts: Optional[int] = None,
+    last_from_me: Optional[bool] = None,
+) -> bool:
+    return await should_reclassify(instance_id, chatid, last_msg_ts, last_from_me)
+
+__all__ = [
+    # oficiais
+    "get_lead_status", "get_many_lead_status", "upsert_lead_status", "should_reclassify",
+    # compat
+    "getCachedLeadStatus", "upsertLeadStatus", "needsReclassify",
+]
