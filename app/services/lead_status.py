@@ -1,99 +1,112 @@
 # app/services/lead_status.py
 from __future__ import annotations
-from typing import Optional, Dict, Any
+from typing import Iterable, List, Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 
 from app.pg import get_pool
 
+# Tabela (vide app/pg.py):
+# lead_status(
+#   instance_id TEXT, chatid TEXT,
+#   stage TEXT, updated_at TIMESTAMPTZ,
+#   last_msg_ts BIGINT, last_from_me BOOLEAN,
+#   PRIMARY KEY(instance_id, chatid)
+# )
 
-def _iso(dt: Optional[datetime]) -> Optional[str]:
-    if not dt:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+async def _row_to_dict(row) -> Dict[str, Any]:
+    if not row:
+        return {}
+    return {
+        "instance_id": row["instance_id"],
+        "chatid": row["chatid"],
+        "stage": row["stage"],
+        "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
+        "last_msg_ts": int(row["last_msg_ts"] or 0),
+        "last_from_me": bool(row["last_from_me"]),
+    }
 
+async def get_lead_status(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            """
+            SELECT instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
+            FROM lead_status
+            WHERE instance_id=$1 AND chatid=$2
+            """,
+            instance_id, chatid,
+        )
+    return await _row_to_dict(row) if row else None
 
-def getCachedLeadStatus(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
-    """
-    Lê do cache (tabela lead_status) escopado por instance_id + chatid.
-    """
-    pool = get_pool()
-    sql = """
-        SELECT instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
-          FROM lead_status
-         WHERE instance_id = %s AND chatid = %s
-         LIMIT 1
-    """
-    with pool.connection() as con:
-        row = con.execute(sql, (instance_id, chatid)).fetchone()
-        if not row:
-            return None
-        return {
-            "instance_id": row[0],
-            "chatid": row[1],
-            "stage": row[2],
-            "updated_at": _iso(row[3]),
-            "last_msg_ts": int(row[4] or 0),
-            "last_from_me": bool(row[5]),
-        }
+async def get_many_lead_status(instance_id: str, chatids: Iterable[str]) -> List[Dict[str, Any]]:
+    ids = [c for c in set(chatids) if c]
+    if not ids:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """
+            SELECT instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
+            FROM lead_status
+            WHERE instance_id=$1 AND chatid = ANY($2)
+            """,
+            instance_id, ids,
+        )
+    out = []
+    for r in rows:
+        out.append(await _row_to_dict(r))
+    return out
 
-
-def upsertLeadStatus(
+async def upsert_lead_status(
     instance_id: str,
     chatid: str,
     stage: str,
     last_msg_ts: int = 0,
     last_from_me: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Insere/atualiza o cache de lead status para (instance_id, chatid).
-    Mantém updated_at = NOW(), e guarda last_msg_ts/last_from_me.
-    """
-    pool = get_pool()
-    sql = """
-        INSERT INTO lead_status (instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me)
-        VALUES (%s, %s, %s, NOW(), %s, %s)
-        ON CONFLICT (instance_id, chatid)
-        DO UPDATE SET
-            stage = EXCLUDED.stage,
-            updated_at = NOW(),
-            last_msg_ts = EXCLUDED.last_msg_ts,
-            last_from_me = EXCLUDED.last_from_me
-        RETURNING instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
-    """
-    with pool.connection() as con:
-        row = con.execute(sql, (instance_id, chatid, stage, int(last_msg_ts or 0), bool(last_from_me))).fetchone()
-        return {
-            "instance_id": row[0],
-            "chatid": row[1],
-            "stage": row[2],
-            "updated_at": _iso(row[3]),
-            "last_msg_ts": int(row[4] or 0),
-            "last_from_me": bool(row[5]),
-        }
+    # normaliza
+    s = (stage or "").strip().lower()
+    if s.startswith("contato"):
+        s = "contatos"
+    elif "lead_quente" in s or "quente" in s:
+        s = "lead_quente"
+    elif s != "lead":
+        s = "contatos"
 
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            """
+            INSERT INTO lead_status (instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me)
+            VALUES ($1, $2, $3, NOW(), $4, $5)
+            ON CONFLICT (instance_id, chatid)
+            DO UPDATE SET
+              stage = EXCLUDED.stage,
+              updated_at = NOW(),
+              last_msg_ts = GREATEST(lead_status.last_msg_ts, EXCLUDED.last_msg_ts),
+              last_from_me = EXCLUDED.last_from_me
+            RETURNING instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
+            """,
+            instance_id, chatid, s, int(last_msg_ts or 0), bool(last_from_me),
+        )
+    return await _row_to_dict(row)
 
-def needsReclassify(
-    cached: Optional[Dict[str, Any]],
-    observed_last_ts: Optional[int] = None,
-    observed_from_me: Optional[bool] = None,
+async def should_reclassify(
+    instance_id: str,
+    chatid: str,
+    last_msg_ts: Optional[int] = None,
+    last_from_me: Optional[bool] = None,
 ) -> bool:
+    """Heurística simples:
+    - Reclassifica se não existir registro
+    - Reclassifica se chegou msg com timestamp maior
+    - Reclassifica se mudou a autoria (ex.: antes era 'me', agora é do cliente)
     """
-    Decide se precisamos reclassificar.
-    Regra simples (compatível com usos típicos no media.py):
-      - Se não há cache => True
-      - Se o timestamp observado é mais recente que o do cache => True
-      - Caso contrário => False
-    """
-    if not cached:
+    cur = await get_lead_status(instance_id, chatid)
+    if not cur:
         return True
-    try:
-        cached_ts = int(cached.get("last_msg_ts") or 0)
-        obs_ts = int(observed_last_ts or 0)
-        if obs_ts > cached_ts:
-            return True
-    except Exception:
-        # se algo der ruim ao parsear, força reclassificação para segurança
+    if last_msg_ts and int(last_msg_ts) > int(cur.get("last_msg_ts") or 0):
+        return True
+    if last_from_me is not None and bool(last_from_me) != bool(cur.get("last_from_me")):
         return True
     return False
