@@ -1,7 +1,6 @@
-# app/services/lead_status.py
 from __future__ import annotations
 from typing import Optional, Dict, Any
-from app.pg import pool
+from app.pg import get_pool
 
 def _row_to_dict(r) -> Dict[str, Any]:
     return {
@@ -14,9 +13,8 @@ def _row_to_dict(r) -> Dict[str, Any]:
 
 def getCachedLeadStatus(chatid: str) -> Optional[Dict[str, Any]]:
     sql = "SELECT chatid, stage, updated_at, last_msg_ts, last_from_me FROM lead_status WHERE chatid = %s"
-    with pool.connection() as con:
-        cur = con.execute(sql, (chatid,))
-        row = cur.fetchone()
+    with get_pool().connection() as con:
+        row = con.execute(sql, (chatid,)).fetchone()
     return _row_to_dict(row) if row else None
 
 def upsertLeadStatus(chatid: str, *, stage: str | None, last_msg_ts: int | None, last_from_me: bool | None) -> Dict[str, Any]:
@@ -30,9 +28,8 @@ def upsertLeadStatus(chatid: str, *, stage: str | None, last_msg_ts: int | None,
         updated_at   = NOW()
     RETURNING chatid, stage, updated_at, last_msg_ts, last_from_me
     """
-    with pool.connection() as con:
-        cur = con.execute(sql, (chatid, stage, last_msg_ts, last_from_me))
-        row = cur.fetchone()
+    with get_pool().connection() as con:
+        row = con.execute(sql, (chatid, stage, last_msg_ts, last_from_me)).fetchone()
     return _row_to_dict(row)
 
 def needsReclassify(chatid: str, new_last_msg_ts: int, new_last_from_me: bool) -> bool:
