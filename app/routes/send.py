@@ -2,6 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from ..utils.jwt_handler import decode_jwt
 import httpx
+import time
+
+# atualiza cache de status ao enviar mensagens
+from app.services.lead_status import upsertLeadStatus
 
 router = APIRouter()
 
@@ -28,7 +32,7 @@ class SendList(BaseModel):
 
 def base(host: str) -> str: return f"https://{host}"
 def hdr(tok: str) -> dict:  return {"token": tok, "Content-Type": "application/json"}
-def to_dict(m: BaseModel) -> dict: return m.model_dump() if hasattr(m,"model_dump") else m.dict()
+def to_dict(m: BaseModel) -> dict: return m.model_dump() if hasattr(m, "model_dump") else m.dict()
 
 @router.post("/send-text")
 async def send_text(body: SendText, user=Depends(decode_jwt)):
@@ -36,8 +40,15 @@ async def send_text(body: SendText, user=Depends(decode_jwt)):
     url = f"{base(host)}/send/text"
     async with httpx.AsyncClient(timeout=30.0) as c:
         r = await c.post(url, headers=hdr(tok), json=to_dict(body))
-        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
-        return r.json()
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        resp = r.json()
+        # marca atividade de saída no cache
+        try:
+            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+        except Exception:
+            pass
+        return resp
 
 @router.post("/send-media")
 async def send_media(body: SendMedia, user=Depends(decode_jwt)):
@@ -45,8 +56,14 @@ async def send_media(body: SendMedia, user=Depends(decode_jwt)):
     url = f"{base(host)}/send/media"
     async with httpx.AsyncClient(timeout=30.0) as c:
         r = await c.post(url, headers=hdr(tok), json=to_dict(body))
-        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
-        return r.json()
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        resp = r.json()
+        try:
+            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+        except Exception:
+            pass
+        return resp
 
 @router.post("/send-buttons")
 async def send_buttons(body: SendButtons, user=Depends(decode_jwt)):
@@ -54,8 +71,14 @@ async def send_buttons(body: SendButtons, user=Depends(decode_jwt)):
     url = f"{base(host)}/send/buttons"
     async with httpx.AsyncClient(timeout=30.0) as c:
         r = await c.post(url, headers=hdr(tok), json=to_dict(body))
-        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
-        return r.json()
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        resp = r.json()
+        try:
+            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+        except Exception:
+            pass
+        return resp
 
 @router.post("/send-list")
 async def send_list(body: SendList, user=Depends(decode_jwt)):
@@ -63,5 +86,11 @@ async def send_list(body: SendList, user=Depends(decode_jwt)):
     url = f"{base(host)}/send/list"
     async with httpx.AsyncClient(timeout=30.0) as c:
         r = await c.post(url, headers=hdr(tok), json=to_dict(body))
-        if r.status_code >= 400: raise HTTPException(r.status_code, r.text)
-        return r.json()
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, r.text)
+        resp = r.json()
+        try:
+            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+        except Exception:
+            pass
+        return resp
