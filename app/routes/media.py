@@ -1,19 +1,28 @@
-import io, re, httpx
-from typing import Optional, Dict, Any, List
+# app/routes/media.py
+from __future__ import annotations
+
+import io
+import re
+import json
+import base64
+from typing import Dict, Any, List
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from starlette.responses import StreamingResponse
 
 from app.routes.deps import get_uazapi_ctx
 from app.routes.ai import classify_by_rules
 
-# cache de classificação (assinaturas com instance_id)
+# cache/serviço de lead status (sincrono, conforme seu módulo)
 from app.services.lead_status import (
     getCachedLeadStatus,
     upsertLeadStatus,
     needsReclassify,
 )
 
-router = APIRouter()
+# ---------- Router com prefixo p/ alinhar com o front (/api/media/...) ----------
+router = APIRouter(prefix="/api/media", tags=["media"])
 
 # ---------------- utils ----------------
 def _uaz(ctx):
@@ -30,25 +39,26 @@ def _pick(d: Dict[str, Any], path: str, default=None):
     return cur if cur is not None else default
 
 def _b64url_to_bytes(s: str) -> bytes:
-    import base64
     pad = "=" * ((4 - len(s) % 4) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
 def _get_instance_id_from_request(req: Request) -> str:
+    # 1) state
     inst = getattr(req.state, "instance_id", None)
     if inst:
         return str(inst)
 
+    # 2) header explícito
     h = req.headers.get("x-instance-id")
     if h:
         return str(h)
 
+    # 3) JWT Bearer
     auth = req.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
         parts = token.split(".")
         if len(parts) >= 2:
-            import json
             try:
                 payload = json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
                 return str(
@@ -64,38 +74,63 @@ def _get_instance_id_from_request(req: Request) -> str:
 
 # ---------------- media proxy/resolve ----------------
 @router.get("/proxy")
-async def media_proxy(u: str = Query(...)):
+async def media_proxy(u: str = Query(..., alias="u")):
     if not re.match(r"^https?://", u):
         raise HTTPException(400, "URL inválida")
-    async with httpx.AsyncClient(timeout=30) as cli:
-        r = await cli.get(u)
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, "Falha ao baixar mídia")
-    ct = r.headers.get("content-type", "application/octet-stream")
-    return StreamingResponse(io.BytesIO(r.content), media_type=ct)
+    try:
+        async with httpx.AsyncClient(timeout=30) as cli:
+            r = await cli.get(u)
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, "Falha ao baixar mídia")
+        ct = r.headers.get("content-type", "application/octet-stream")
+        return StreamingResponse(io.BytesIO(r.content), media_type=ct)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"proxy erro: {e}")
 
 @router.post("/resolve")
 async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uazapi_ctx)):
     m = payload or {}
-    mime = ( m.get("mimetype") or m.get("mime") or
-             _pick(m,"message.imageMessage.mimetype") or
-             _pick(m,"message.videoMessage.mimetype") or
-             _pick(m,"message.documentMessage.mimetype") or
-             _pick(m,"message.audioMessage.mimetype") or
-             _pick(m,"message.stickerMessage.mimetype") or "" )
-    url = ( m.get("mediaUrl") or m.get("url") or m.get("fileUrl") or m.get("downloadUrl") or
-            m.get("image") or m.get("video") or
-            _pick(m,"message.imageMessage.url") or _pick(m,"message.videoMessage.url") or
-            _pick(m,"message.documentMessage.url") or _pick(m,"message.audioMessage.url") or
-            _pick(m,"message.stickerMessage.url") or "" )
-    data_url = ( m.get("dataUrl") or _pick(m,"message.imageMessage.dataUrl") or
-                 _pick(m,"message.videoMessage.dataUrl") or _pick(m,"message.stickerMessage.dataUrl") or "" )
+
+    mime = (
+        m.get("mimetype") or m.get("mime")
+        or _pick(m, "message.imageMessage.mimetype")
+        or _pick(m, "message.videoMessage.mimetype")
+        or _pick(m, "message.documentMessage.mimetype")
+        or _pick(m, "message.audioMessage.mimetype")
+        or _pick(m, "message.stickerMessage.mimetype")
+        or ""
+    )
+    url = (
+        m.get("mediaUrl") or m.get("url") or m.get("fileUrl") or m.get("downloadUrl")
+        or m.get("image") or m.get("video")
+        or _pick(m, "message.imageMessage.url")
+        or _pick(m, "message.videoMessage.url")
+        or _pick(m, "message.documentMessage.url")
+        or _pick(m, "message.audioMessage.url")
+        or _pick(m, "message.stickerMessage.url")
+        or ""
+    )
+    data_url = (
+        m.get("dataUrl")
+        or _pick(m, "message.imageMessage.dataUrl")
+        or _pick(m, "message.videoMessage.dataUrl")
+        or _pick(m, "message.stickerMessage.dataUrl")
+        or ""
+    )
     if url or data_url:
         return {"url": url, "mime": mime, "dataUrl": data_url}
 
-    media_id = ( m.get("mediaId") or _pick(m,"message.documentMessage.mediaKey") or
-                 _pick(m,"message.imageMessage.mediaKey") or _pick(m,"message.videoMessage.mediaKey") or
-                 _pick(m,"message.audioMessage.mediaKey") or _pick(m,"message.stickerMessage.mediaKey") or None )
+    media_id = (
+        m.get("mediaId")
+        or _pick(m, "message.documentMessage.mediaKey")
+        or _pick(m, "message.imageMessage.mediaKey")
+        or _pick(m, "message.videoMessage.mediaKey")
+        or _pick(m, "message.audioMessage.mediaKey")
+        or _pick(m, "message.stickerMessage.mediaKey")
+        or None
+    )
 
     base, headers = _uaz(ctx)
     async with httpx.AsyncClient(timeout=30) as cli:
@@ -110,11 +145,11 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
                     j = r.json()
                 except Exception:
                     continue
-                u = j.get("url") or j.get("downloadUrl")
+                u2 = j.get("url") or j.get("downloadUrl")
                 mm = j.get("mime") or j.get("mimetype") or mime
-                d = j.get("dataUrl") or ""
-                if u or d:
-                    return {"url": u, "mime": mm, "dataUrl": d}
+                d2 = j.get("dataUrl") or ""
+                if u2 or d2:
+                    return {"url": u2, "mime": mm, "dataUrl": d2}
 
     raise HTTPException(404, "Não foi possível resolver a mídia")
 
@@ -134,14 +169,15 @@ def _from_me(m: Dict[str, Any]) -> bool:
         or m.get("fromme")
         or m.get("from_me")
         or (m.get("key") or {}).get("fromMe")
+        or (m.get("message") or {}).get("key", {}).get("fromMe")
     )
 
 @router.post("/stage/classify")
 async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     payload: { chatid?: str, messages: [...] }
-    - Lê instance_id do JWT
-    - Usa cache (DB) se não precisar reclassificar
+    - Lê instance_id do JWT/headers
+    - Usa cache (DB/mem) se não precisar reclassificar
     - Caso precise, classifica, persiste e retorna
     """
     instance_id = _get_instance_id_from_request(request)
@@ -155,16 +191,17 @@ async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     last_ts = _ts(last) if last else 0
     last_from_me = _from_me(last) if last else False
 
-    # cache: se não precisa reclassificar, devolve do banco
     if chatid and not needsReclassify(instance_id, chatid, last_ts, last_from_me):
         cached = getCachedLeadStatus(instance_id, chatid)
         if cached:
-            return {"stage": cached["stage"], "cached": True, "last_msg_ts": cached.get("last_msg_ts", 0)}
+            return {
+                "stage": cached["stage"],
+                "cached": True,
+                "last_msg_ts": int(cached.get("last_msg_ts") or 0),
+            }
 
-    # classifica pelas regras atuais
     stage = classify_by_rules(items) or "contatos"
 
-    # persiste no cache por instância
     if chatid:
         rec = upsertLeadStatus(
             instance_id=instance_id,
@@ -173,6 +210,10 @@ async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
             last_msg_ts=last_ts,
             last_from_me=last_from_me,
         )
-        return {"stage": rec["stage"], "cached": False, "last_msg_ts": rec.get("last_msg_ts", last_ts)}
+        return {
+            "stage": rec["stage"],
+            "cached": False,
+            "last_msg_ts": int(rec.get("last_msg_ts") or last_ts),
+        }
 
     return {"stage": stage, "cached": False, "last_msg_ts": last_ts}
