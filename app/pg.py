@@ -1,14 +1,17 @@
-# app/pg.py
 import os
 from psycopg_pool import ConnectionPool
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("Env DATABASE_URL ausente")
+_pool = None
 
-POOL_SIZE = int(os.getenv("PGPOOL_SIZE", "5"))
-
-pool = ConnectionPool(conninfo=DATABASE_URL, max_size=POOL_SIZE, kwargs={"autocommit": True})
+def get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        dsn = os.getenv("DATABASE_URL")
+        if not dsn:
+            raise RuntimeError("DATABASE_URL não definido no ambiente em runtime")
+        size = int(os.getenv("PGPOOL_SIZE", "5"))
+        _pool = ConnectionPool(conninfo=dsn, max_size=size, kwargs={"autocommit": True})
+    return _pool
 
 def init_schema():
     sql = """
@@ -23,5 +26,5 @@ def init_schema():
     CREATE INDEX IF NOT EXISTS idx_lead_status_updated_at   ON lead_status(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_lead_status_last_msg_ts  ON lead_status(last_msg_ts DESC);
     """
-    with pool.connection() as con:
+    with get_pool().connection() as con:
         con.execute(sql)
