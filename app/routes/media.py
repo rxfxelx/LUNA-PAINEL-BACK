@@ -6,6 +6,13 @@ from starlette.responses import StreamingResponse
 from app.routes.deps import get_uazapi_ctx
 from app.routes.ai import classify_by_rules
 
+# cache de classificação
+from app.services.lead_status import (
+    getCachedLeadStatus,
+    upsertLeadStatus,
+    needsReclassify,
+)
+
 router = APIRouter()
 
 def _uaz(ctx):
@@ -76,7 +83,42 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
 
     raise HTTPException(404, "Não foi possível resolver a mídia")
 
+# ---------- Classificação com cache ----------
+def _ts(m: Dict[str, Any]) -> int:
+    return int(
+        m.get("messageTimestamp")
+        or m.get("timestamp")
+        or m.get("t")
+        or (m.get("message") or {}).get("messageTimestamp")
+        or 0
+    )
+
+def _from_me(m: Dict[str, Any]) -> bool:
+    return bool(
+        m.get("fromMe")
+        or m.get("fromme")
+        or m.get("from_me")
+        or (m.get("key") or {}).get("fromMe")
+    )
+
 @router.post("/stage/classify")
 async def stage_classify(payload: Dict[str, Any] = Body(...)):
+    # payload esperado: { chatid?: str, messages: [...] }
+    chatid = str(payload.get("chatid") or "").strip()
     items = payload.get("messages") or []
-    return {"stage": classify_by_rules(items)}
+
+    last = max(items, key=_ts) if items else None
+    last_ts = _ts(last) if last else 0
+    last_from_me = _from_me(last) if last else False
+
+    # Se temos chatid e não há mensagem mais nova, devolve cache
+    if chatid and not needsReclassify(chatid, last_ts, last_from_me):
+        cached = getCachedLeadStatus(chatid)
+        if cached:
+            return {"stage": cached["stage"], "cached": True}
+
+    # Caso contrário, classifica pelas regras existentes e atualiza cache
+    stage = classify_by_rules(items)
+    if chatid:
+        upsertLeadStatus(chatid, stage=stage, last_msg_ts=last_ts, last_from_me=last_from_me)
+    return {"stage": stage, "cached": False}
