@@ -21,8 +21,8 @@ from app.services.lead_status import (
     needsReclassify,
 )
 
-router = APIRouter(prefix="/api/media", tags=["media"])
-
+# >>> sem prefix aqui; o prefix fica no main.py <<<
+router = APIRouter()
 
 # ---------------- utils ----------------
 def _uaz(ctx: Dict[str, Any]):
@@ -67,9 +67,8 @@ def _get_instance_id_from_request(req: Request) -> str:
                 pass
     return ""
 
-
 # ---------------- media proxy/resolve ----------------
-@router.get("/proxy")
+@router.get("/media/proxy")
 async def media_proxy(u: str = Query(..., min_length=4)):
     if not re.match(r"^https?://", u):
         raise HTTPException(400, "URL inválida")
@@ -85,7 +84,7 @@ async def media_proxy(u: str = Query(..., min_length=4)):
     except Exception as e:
         raise HTTPException(502, f"proxy erro: {e}")
 
-@router.post("/resolve")
+@router.post("/media/resolve")
 async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uazapi_ctx)):
     if not ctx or "host" not in ctx or "token" not in ctx:
         raise HTTPException(500, "Contexto UAZ inválido")
@@ -152,7 +151,6 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
 
     raise HTTPException(404, "Não foi possível resolver a mídia")
 
-
 # ---------------- Classificação com cache ----------------
 def _ts(m: Dict[str, Any]) -> int:
     return int(
@@ -172,7 +170,7 @@ def _from_me(m: Dict[str, Any]) -> bool:
         or (m.get("message") or {}).get("key", {}).get("fromMe")
     )
 
-@router.post("/stage/classify")
+@router.post("/media/stage/classify")
 async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     payload: { chatid?: str, messages: [...] }
