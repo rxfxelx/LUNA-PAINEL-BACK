@@ -1,17 +1,28 @@
 # app/routes/lead_status.py
 from __future__ import annotations
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from fastapi import APIRouter, Query, Body, HTTPException, Request
 
+# tenta importar a versão bulk do service (opcional)
 try:
-    from app.services.lead_status import getCachedLeadStatus, get_many_lead_status  # async
+    from app.services.lead_status import getCachedLeadStatus, getCachedLeadStatusBulk  # type: ignore
     _HAS_BULK = True
 except Exception:  # pragma: no cover
-    from app.services.lead_status import getCachedLeadStatus  # async
+    from app.services.lead_status import getCachedLeadStatus  # type: ignore
     _HAS_BULK = False
+
+    async def getCachedLeadStatusBulk(instance_id: str, chatids: List[str]):
+        """Fallback simples (assíncrono): faz N chamadas unitárias com await."""
+        out = []
+        for cid in chatids:
+            rec = await getCachedLeadStatus(instance_id, cid)
+            if rec:
+                out.append(rec)
+        return out
 
 router = APIRouter()
 
+# ---------------- util: extrai instance_id do JWT sem dependências externas
 def _b64url_to_bytes(s: str) -> bytes:
     import base64
     pad = "=" * ((4 - len(s) % 4) % 4)
@@ -43,13 +54,14 @@ def _get_instance_id_from_request(req: Request) -> str:
                 pass
     return ""
 
+# ---------------- endpoints
 @router.get("/lead-status")
 async def get_one(request: Request, chatid: str = Query(..., min_length=1)):
     instance_id = _get_instance_id_from_request(request)
     if not instance_id:
         raise HTTPException(401, "JWT sem instance_id")
 
-    rec = await getCachedLeadStatus(instance_id, chatid)
+    rec = await getCachedLeadStatus(instance_id, chatid)  # <-- await
     if not rec:
         return {"found": False}
     return {"found": True, **rec}
@@ -68,14 +80,10 @@ async def get_bulk(request: Request, payload: Dict[str, Any] = Body(...)):
     if len(dedup) > 2000:
         dedup = dedup[:2000]
 
-    if _HAS_BULK:
-        items = await get_many_lead_status(instance_id, dedup)  # ✅ bulk real
-    else:
-        # fallback assíncrono (N chamadas)
-        items = []
-        for cid in dedup:
-            rec = await getCachedLeadStatus(instance_id, cid)
-            if rec:
-                items.append(rec)
-
-    return {"items": items, "count": len(items), "requested": len(dedup), "bulk_accelerated": _HAS_BULK}
+    items = await getCachedLeadStatusBulk(instance_id, dedup)  # <-- await
+    return {
+        "items": items,
+        "count": len(items),
+        "requested": len(dedup),
+        "bulk_accelerated": _HAS_BULK,
+    }
