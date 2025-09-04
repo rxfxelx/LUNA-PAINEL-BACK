@@ -1,7 +1,6 @@
 # app/services/lead_status.py
 from __future__ import annotations
 from typing import Iterable, List, Optional, Dict, Any, Tuple
-from datetime import datetime, timezone
 
 from starlette.concurrency import run_in_threadpool
 from app.pg import get_pool
@@ -14,7 +13,7 @@ from app.pg import get_pool
 #   PRIMARY KEY(instance_id, chatid)
 # )
 
-# ---------- helpers sync (psycopg) ----------
+# ---------- helpers ----------
 
 def _row_to_dict(row: Tuple) -> Dict[str, Any]:
     # row order must match SELECT order below
@@ -40,29 +39,86 @@ def _normalize_stage(stage: str) -> str:
         return "lead"
     return "contatos"
 
-# ---------- SYNC core (usa psycopg pool) ----------
+def _canon_forms(cid: str) -> List[str]:
+    """
+    Retorna as duas formas equivalentes de chatid:
+    - sem sufixo
+    - com sufixo @s.whatsapp.net
+    """
+    c = (cid or "").strip()
+    if not c:
+        return []
+    if "@s.whatsapp.net" in c:
+        base = c.replace("@s.whatsapp.net", "")
+        return [base, c]
+    # se já parecer um grupo (g.us) ou outro domínio, mantém
+    if "@g.us" in c or "@" in c:
+        return [c]
+    return [c, f"{c}@s.whatsapp.net"]
+
+def _guess_store_chatid(con, instance_id: str, chatid: str) -> str:
+    """
+    Escolhe qual chatid usar para armazenar:
+    - se já existe registro para alguma forma, usa exatamente a que existe
+    - senão, se veio sem domínio e é só dígito, usa com @s.whatsapp.net
+    - fallback: usa o recebido
+    """
+    forms = _canon_forms(chatid)
+    placeholders = ", ".join(["%s"] * len(forms))
+    with con.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT chatid
+              FROM lead_status
+             WHERE instance_id = %s AND chatid IN ({placeholders})
+             ORDER BY updated_at DESC
+             LIMIT 1
+            """,
+            (instance_id, *forms),
+        )
+        r = cur.fetchone()
+        if r and r[0]:
+            return str(r[0])
+
+    base = chatid.strip()
+    if ("@" not in base) and base.isdigit():
+        return f"{base}@s.whatsapp.net"
+    return chatid
+
+# ---------- SYNC core (psycopg pool síncrono) ----------
 
 def _get_lead_status_sync(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
-    pool = get_pool()  # psycopg.ConnectionPool (sync)
+    pool = get_pool()
+    ids = _canon_forms(chatid)
+    if not ids:
+        return None
+    placeholders = ", ".join(["%s"] * len(ids))
     with pool.connection() as con:
         with con.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
                   FROM lead_status
-                 WHERE instance_id = %s AND chatid = %s
+                 WHERE instance_id = %s AND chatid IN ({placeholders})
+                 ORDER BY updated_at DESC
+                 LIMIT 1
                 """,
-                (instance_id, chatid),
+                (instance_id, *ids),
             )
             row = cur.fetchone()
     return _row_to_dict(row) if row else None
 
 def _get_many_lead_status_sync(instance_id: str, chatids: Iterable[str]) -> List[Dict[str, Any]]:
-    ids = [c for c in dict.fromkeys(chatids) if c]  # dedup + remove vazios
-    if not ids:
+    base_ids = [c for c in dict.fromkeys(chatids) if c]
+    if not base_ids:
         return []
-    placeholders = ", ".join(["%s"] * len(ids))
-    params: Tuple[Any, ...] = (instance_id, *ids)
+    # expande cada id para formas canônicas e dedup
+    all_ids: List[str] = []
+    for c in base_ids:
+        all_ids.extend(_canon_forms(c))
+    all_ids = list(dict.fromkeys(all_ids))
+    placeholders = ", ".join(["%s"] * len(all_ids))
+    params: Tuple[Any, ...] = (instance_id, *all_ids)
 
     pool = get_pool()
     with pool.connection() as con:
@@ -88,6 +144,7 @@ def _upsert_lead_status_sync(
     s = _normalize_stage(stage)
     pool = get_pool()
     with pool.connection() as con:
+        store_chatid = _guess_store_chatid(con, instance_id, chatid)
         with con.cursor() as cur:
             cur.execute(
                 """
@@ -101,7 +158,7 @@ def _upsert_lead_status_sync(
                   last_from_me = EXCLUDED.last_from_me
                 RETURNING instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me
                 """,
-                (instance_id, chatid, s, int(last_msg_ts or 0), bool(last_from_me)),
+                (instance_id, store_chatid, s, int(last_msg_ts or 0), bool(last_from_me)),
             )
             row = cur.fetchone()
     return _row_to_dict(row)
@@ -121,7 +178,7 @@ def _should_reclassify_sync(
         return True
     return False
 
-# ---------- API assíncrona (wrappers) ----------
+# ---------- Wrappers assíncronos ----------
 
 async def get_lead_status(instance_id: str, chatid: str) -> Optional[Dict[str, Any]]:
     return await run_in_threadpool(_get_lead_status_sync, instance_id, chatid)
