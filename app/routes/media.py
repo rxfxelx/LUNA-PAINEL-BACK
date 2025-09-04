@@ -23,7 +23,9 @@ from app.services.lead_status import (
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 
-def _uaz(ctx):
+
+# ---------------- utils ----------------
+def _uaz(ctx: Dict[str, Any]):
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
     return base, headers
@@ -65,12 +67,14 @@ def _get_instance_id_from_request(req: Request) -> str:
                 pass
     return ""
 
+
+# ---------------- media proxy/resolve ----------------
 @router.get("/proxy")
-async def media_proxy(u: str = Query(..., alias="u")):
+async def media_proxy(u: str = Query(..., min_length=4)):
     if not re.match(r"^https?://", u):
         raise HTTPException(400, "URL inválida")
     try:
-        async with httpx.AsyncClient(timeout=30) as cli:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as cli:
             r = await cli.get(u)
         if r.status_code >= 400:
             raise HTTPException(r.status_code, "Falha ao baixar mídia")
@@ -83,6 +87,9 @@ async def media_proxy(u: str = Query(..., alias="u")):
 
 @router.post("/resolve")
 async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uazapi_ctx)):
+    if not ctx or "host" not in ctx or "token" not in ctx:
+        raise HTTPException(500, "Contexto UAZ inválido")
+
     m = payload or {}
 
     mime = (
@@ -125,7 +132,7 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
     )
 
     base, headers = _uaz(ctx)
-    async with httpx.AsyncClient(timeout=30) as cli:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as cli:
         candidates = []
         if media_id:
             candidates.append(("GET", f"{base}/media/resolve?id={media_id}", None))
@@ -145,6 +152,8 @@ async def media_resolve(payload: Dict[str, Any] = Body(...), ctx=Depends(get_uaz
 
     raise HTTPException(404, "Não foi possível resolver a mídia")
 
+
+# ---------------- Classificação com cache ----------------
 def _ts(m: Dict[str, Any]) -> int:
     return int(
         m.get("messageTimestamp")
@@ -167,6 +176,9 @@ def _from_me(m: Dict[str, Any]) -> bool:
 async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     """
     payload: { chatid?: str, messages: [...] }
+    - Lê instance_id do JWT
+    - Usa cache (DB) se não precisar reclassificar
+    - Caso precise, classifica, persiste e retorna
     """
     instance_id = _get_instance_id_from_request(request)
     if not instance_id:
@@ -179,7 +191,7 @@ async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
     last_ts = _ts(last) if last else 0
     last_from_me = _from_me(last) if last else False
 
-    # 👇 **agora com await**
+    # cache: se não precisa reclassificar, devolve do banco
     if chatid and not await needsReclassify(instance_id, chatid, last_ts, last_from_me):
         cached = await getCachedLeadStatus(instance_id, chatid)
         if cached:
@@ -189,8 +201,10 @@ async def stage_classify(request: Request, payload: Dict[str, Any] = Body(...)):
                 "last_msg_ts": int(cached.get("last_msg_ts") or 0),
             }
 
+    # classifica pelas regras atuais
     stage = classify_by_rules(items) or "contatos"
 
+    # persiste no cache por instância
     if chatid:
         rec = await upsertLeadStatus(
             instance_id=instance_id,
