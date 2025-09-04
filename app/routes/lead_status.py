@@ -1,18 +1,22 @@
 # app/routes/lead_status.py
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Query, Body, HTTPException, Request
+import logging
 
-# tenta importar a versão bulk do service (opcional)
+# tenta importar a versão bulk do service (assíncrona)
 try:
-    from app.services.lead_status import getCachedLeadStatus, getCachedLeadStatusBulk  # type: ignore
+    from app.services.lead_status import (  # type: ignore
+        getCachedLeadStatus,
+        getCachedLeadStatusBulk,
+    )
     _HAS_BULK = True
-except Exception:  # pragma: no cover
+except Exception:
+    # fallback assíncrono que chama o unitário em loop (com await!)
     from app.services.lead_status import getCachedLeadStatus  # type: ignore
     _HAS_BULK = False
 
     async def getCachedLeadStatusBulk(instance_id: str, chatids: List[str]):
-        """Fallback simples (assíncrono): faz N chamadas unitárias com await."""
         out = []
         for cid in chatids:
             rec = await getCachedLeadStatus(instance_id, cid)
@@ -21,8 +25,9 @@ except Exception:  # pragma: no cover
         return out
 
 router = APIRouter()
+log = logging.getLogger("uvicorn.error")
 
-# ---------------- util: extrai instance_id do JWT sem dependências externas
+# -------- utils: extrai instance_id do JWT --------
 def _b64url_to_bytes(s: str) -> bytes:
     import base64
     pad = "=" * ((4 - len(s) % 4) % 4)
@@ -54,16 +59,17 @@ def _get_instance_id_from_request(req: Request) -> str:
                 pass
     return ""
 
-# ---------------- endpoints
+# -------- endpoints --------
 @router.get("/lead-status")
 async def get_one(request: Request, chatid: str = Query(..., min_length=1)):
     instance_id = _get_instance_id_from_request(request)
     if not instance_id:
         raise HTTPException(401, "JWT sem instance_id")
 
-    rec = await getCachedLeadStatus(instance_id, chatid)  # <-- await
+    rec = await getCachedLeadStatus(instance_id, chatid)
     if not rec:
         return {"found": False}
+
     return {"found": True, **rec}
 
 @router.post("/lead-status/bulk")
@@ -80,7 +86,10 @@ async def get_bulk(request: Request, payload: Dict[str, Any] = Body(...)):
     if len(dedup) > 2000:
         dedup = dedup[:2000]
 
-    items = await getCachedLeadStatusBulk(instance_id, dedup)  # <-- await
+    # LOG p/ depurar se o front está chamando
+    log.info("lead-status/bulk req: instance=%s, qtd=%d", instance_id, len(dedup))
+
+    items = await getCachedLeadStatusBulk(instance_id, dedup)  # <-- await (importante!)
     return {
         "items": items,
         "count": len(items),
