@@ -28,7 +28,7 @@ def allowed_origins():
     return [o.strip() for o in raw.split(",") if o.strip()]
 
 
-app = FastAPI(title="Luna Backend", version="1.0.0")  # <- atributo que o Uvicorn procura
+app = FastAPI(title="Luna Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,7 +75,7 @@ app.include_router(crm.router,            prefix="/api/crm",    tags=["crm"])
 # IA
 app.include_router(ai.router,             prefix="/api",        tags=["ai"])
 
-# MEDIA  (o router já tem prefixo /api/media dentro do arquivo; NÃO duplicar aqui)
+# MEDIA  (router já tem prefixo /api/media dentro do arquivo)
 app.include_router(media.router)
 
 # Lead status cache (router sem prefixo interno; aqui aplicamos /api)
