@@ -1,81 +1,118 @@
-import unicodedata
-from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, Body
+# app/routes/ai.py
+from __future__ import annotations
 
-router = APIRouter()
+import asyncio
+from typing import Any, Dict, Optional
 
-def _norm(s: Optional[str]) -> str:
-    s = (s or "").lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return " ".join(s.split())
+from app.services.lead_status import (  # type: ignore
+    upsert_lead_status,
+    should_reclassify,
+    get_lead_status,
+)
 
-def _pick(d: Dict[str, Any], path: str, default=None):
-    cur = d
-    for p in path.split("."):
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(p)
-    return cur if cur is not None else default
+# ------------------------------------------------------------------
+# Utilidades
+# ------------------------------------------------------------------
 
-HOT_HINTS = [ "vou te passar para","vou te passar pro","vou passar voce para","vou passar você para",
-  "vou passar para o setor","vou passar para o departamento","vou passar para o time",
-  "vou passar seu contato","vou passar o seu contato","vou passar seu numero","vou passar o seu numero",
-  "vou repassar seu contato","repassei seu contato","enviei seu contato","vou enviar seu contato","enviarei seu contato",
-  "vou encaminhar","encaminhando seu contato","encaminhei seu contato","encaminhei seu numero","encaminhei seu número",
-  "encaminhar seu contato","estou encaminhando","encaminharei",
-  "vou te colocar em contato","vou colocar voce em contato","vou colocar você em contato","colocar voce em contato","colocar você em contato",
-  "vou te conectar","vou te por em contato","te coloco em contato",
-  "o time comercial vai te chamar","o time vai te chamar","nossa equipe vai entrar em contato","a equipe vai entrar em contato","o setor vai entrar em contato",
-  "o atendente vai falar com voce","o atendente vai falar com você","um atendente vai te chamar","um consultor vai te chamar","o consultor vai te chamar",
-  "o especialista vai te chamar","o responsavel vai te chamar","o responsável vai te chamar","o pessoal do comercial te chama","suporte vai te chamar",
-  "vendas vai te chamar","pre-vendas vai te chamar","pré-vendas vai te chamar",
-  "vou pedir para alguem te chamar","vou pedir para alguém te chamar","vou pedir pra alguem te chamar","vou pedir pra alguém te chamar",
-  "vou pedir pro pessoal te chamar","vou pedir para o time te chamar","ja pedi para te chamarem","já pedi para te chamarem",
-  "vou transferir","estou transferindo","transferencia para o setor","transferência para o setor",
-  "transferi sua solicitacao","transferi sua solicitação","direcionei seu contato","direcionando seu contato","direcionar seu contato",
-  "daqui a pouco te chamam","em breve vao entrar em contato","em breve vão entrar em contato","abrirei um chamado","vou abrir um chamado","abrir um ticket","abrirei um ticket",
-]
-HOT_NEGATIVE_GUARDS = [ "cardapio","cardápio","menu","catalogo","catálogo","ver menu","ver cardapio",
-  "acesse o menu","acesse o cardapio","acesse o cardápio","acesse nosso catalogo","acesse nosso catálogo",
-  "cardapio online","link do menu","nosso menu","veja o menu","veja o cardapio","veja o catálogo",
-]
-LEAD_OK_PATTERNS = [ "sim, pode continuar","sim pode continuar","pode continuar","ok, pode continuar","ok pode continuar",
-  "pode seguir","sim, pode seguir","sim pode seguir","vamos continuar","podemos continuar",
-  "pode prosseguir","ok vamos prosseguir","segue","segue por favor","pode mostrar","pode me mostrar",
-  "pode enviar","pode mandar","pode continuar 👍","pode continuar sim","sim, pode continuar sim",
-  "pode continuar por favor","pode continuar pf","pode continuar pff","pode cont","pode cnt","pode seg",
-  "pode prosseg","pode proseguir",
-]
-LEAD_NAME_PATTERNS = [ "qual seu nome","qual o seu nome","me diga seu nome","me fala seu nome","como voce se chama","como você se chama",
-  "quem fala","quem esta falando","quem está falando","quem e voce","quem é você","pode me dizer seu nome",
-  "me passa seu nome","me informe seu nome","seu nome por favor","nome pfv","nome por favor","nome?","qual seu primeiro nome",
-  "qual seu nome completo","nome do cliente","nome do titular","nome para cadastro","poderia me informar seu nome","me diga o seu nome",
-  "informe seu nome","sobrenome","seu nome e sobrenome","como devo te chamar","como posso te chamar","qual e seu nome","qual é seu nome","qual seria seu nome",
-  "ql seu nome","q seu nome","seu nm","seu nome sff","seu nome pf",
-]
+def _normalize_stage(s: str) -> str:
+    s = (s or "").strip().lower()
+    if s.startswith("contato"):
+        return "contatos"
+    if "lead_quente" in s or "quente" in s:
+        return "lead_quente"
+    if s == "lead":
+        return "lead"
+    return "contatos"
 
-def classify_by_rules(items: List[Dict[str, Any]]) -> str:
-    stage = "contatos"
-    for m in items or []:
-        me = m.get("fromMe") or m.get("fromme") or m.get("from_me")
-        if not me:
-            continue
-        text = ( m.get("text") or m.get("caption") or
-                 _pick(m,"message.text") or _pick(m,"message.conversation") or
-                 _pick(m,"message.extendedTextMessage.text") or
-                 m.get("body") or "" )
-        t = _norm(text)
-        if not t:
-            continue
-        if not any(g in t for g in HOT_NEGATIVE_GUARDS) and any(h in t for h in HOT_HINTS):
-            return "lead_quente"
-        if any(p in t for p in LEAD_OK_PATTERNS) or any(p in t for p in LEAD_NAME_PATTERNS):
-            stage = "lead"
-    return stage
+def _last_ts_guard(ts: Optional[int]) -> int:
+    try:
+        n = int(ts or 0)
+    except Exception:
+        return 0
+    if len(str(n)) == 10:
+        n *= 1000
+    return n
 
-@router.post("/ai/classify")
-def api_classify(payload: Dict[str, Any] = Body(...)):
-    items = payload.get("messages") or []
-    stage = classify_by_rules(items)
+# ------------------------------------------------------------------
+# Heurística/placeholder de classificação
+# ------------------------------------------------------------------
+async def _heuristic_stage(chatid: str, ctx: Dict[str, Any] | None = None, limit: int = 200) -> str:
+    """
+    Placeholder simples: se não houver um classificador externo plugado,
+    devolve 'contatos'. Aqui você pode plugar sua IA real se quiser.
+    """
+    # >>> plugar IA real aqui, se existir <<<
+    # e.g.: chamar um endpoint interno, OpenAI, etc.
+    await asyncio.sleep(0)  # só p/ manter assinatura assíncrona
+    return "contatos"
+
+# ------------------------------------------------------------------
+# API pública usada pelos outros módulos
+# ------------------------------------------------------------------
+async def classify_chat(
+    chatid: str,
+    persist: bool = True,
+    limit: int = 200,
+    ctx: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Retorna {"stage": "..."}.
+    - Se já existir no banco e não precisar reclassificar, devolve o salvo.
+    - Caso precise (ou não exista), usa a heurística/IA e persiste se `persist=True`.
+    """
+    instance_id = str((ctx or {}).get("instance_id") or "")
+
+    # tenta usar o salvo, se não precisar reclassificar
+    try:
+        cur = await get_lead_status(instance_id, chatid)
+    except Exception:
+        cur = None
+
+    last_msg_ts = None  # se quiser, passe por ctx e use aqui
+
+    need_reclass = True
+    if cur and cur.get("stage"):
+        try:
+            need_reclass = await should_reclassify(
+                instance_id, chatid,
+                last_msg_ts=_last_ts_guard(last_msg_ts),
+                last_from_me=None,
+            )
+        except Exception:
+            need_reclass = False
+
+        if not need_reclass:
+            return {"stage": _normalize_stage(str(cur["stage"]))}
+
+    # classifica
+    stage = await _heuristic_stage(chatid, ctx=ctx, limit=limit)
+    stage = _normalize_stage(stage)
+
+    # persiste se pedido
+    if persist:
+        try:
+            await upsert_lead_status(
+                instance_id,
+                chatid,
+                stage,
+                last_msg_ts=_last_ts_guard(last_msg_ts),
+                last_from_me=False,
+            )
+        except Exception:
+            pass
+
     return {"stage": stage}
+
+# ------------------------------------------------------------------
+# Compatibilidade com versões antigas
+# ------------------------------------------------------------------
+async def classify_stage(
+    chatid: str,
+    persist: bool = True,
+    limit: int = 200,
+    ctx: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Alias de compatibilidade. Antigo nome importado por messages.py.
+    """
+    return await classify_chat(chatid=chatid, persist=persist, limit=limit, ctx=ctx)
