@@ -1,5 +1,6 @@
 # app/auth.py
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 router = APIRouter()
 security = HTTPBearer(auto_error=True)
 
-# --------- ENV ROBUSTA ---------
+# --------- ENV helpers ---------
 def _get_env_str(*keys: str, default: str = "") -> str:
     for k in keys:
         v = os.getenv(k)
@@ -32,12 +33,14 @@ def _get_exp_minutes() -> int:
 JWT_SECRET          = _get_env_str("JWT_SECRET", "LUNA_JWT_SECRET", default="change-me")
 JWT_ALGORITHM       = _get_env_str("JWT_ALGORITHM", default="HS256")
 JWT_EXPIRE_MINUTES  = _get_exp_minutes()
-DEFAULT_UAZAPI_HOST = _get_env_str("UAZAPI_HOST")
+DEFAULT_UAZAPI_HOST = _get_env_str("UAZAPI_HOST")  # ex: api.uazapi.com
+
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 # --------- MODELOS ---------
 class LoginIn(BaseModel):
-    token: str                         # token da instância UAZAPI
-    host: Optional[str] = None         # opcional; se não vier, usa UAZAPI_HOST
+    token: str                         # token/sessão da instância na UAZAPI (ou às vezes te passam o UUID)
+    host: Optional[str] = None         # se não vier, usa UAZAPI_HOST
     label: Optional[str] = None
     number_hint: Optional[str] = None
 
@@ -45,7 +48,7 @@ class LoginOut(BaseModel):
     jwt: str
     profile: Dict[str, Any]
 
-# --------- JWT HELPERS ---------
+# --------- JWT helpers ---------
 def _jwt_encode(payload: dict) -> str:
     try:
         return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -69,34 +72,76 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # --------- ROTAS ---------
 @router.post("/login", response_model=LoginOut)
 def login(body: LoginIn) -> LoginOut:
-    instance_token = (body.token or "").strip()
-    if not instance_token:
+    """
+    Gera um JWT contendo:
+      - token: token/sessão da UAZAPI (obrigatório)
+      - host: host/base da UAZAPI (obrigatório; vem do body ou de UAZAPI_HOST)
+      - instance_id (quando o 'token' tiver cara de UUID, gravamos também)
+      - claims auxiliares (label/number_hint) para a UI
+    """
+    raw_token = (body.token or "").strip()
+    if not raw_token:
         raise HTTPException(status_code=400, detail="Informe o token da instância")
 
     host = (body.host or DEFAULT_UAZAPI_HOST or "").strip()
     if not host:
-        raise HTTPException(status_code=400, detail="Host da UAZAPI ausente (defina UAZAPI_HOST ou envie 'host' no login)")
+        raise HTTPException(
+            status_code=400,
+            detail="Host da UAZAPI ausente. Defina a env UAZAPI_HOST ou envie 'host' no login."
+        )
+
+    # normaliza host (sem protocolo no começo)
+    host = host.replace("https://", "").replace("http://", "").strip("/")
+
+    # Se parecer um UUID, guardamos também como instance_id (ajuda nas rotas que persistem no banco)
+    instance_id: Optional[str] = raw_token if UUID_RE.match(raw_token) else None
 
     now = datetime.utcnow()
     exp = now + timedelta(minutes=JWT_EXPIRE_MINUTES)
     payload = {
+        "iss": "luna-backend",
         "sub": "luna-user",
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
-        # claims usados pelas rotas:
-        "token": instance_token,          # <<< usado diretamente
-        "instance_token": instance_token, # <<< mantido por compat
-        "host": host,                     # <<< usado diretamente (ou por compat)
-        # perfil opcional
+        # usados pelas rotas/deps:
+        "token": raw_token,          # header "token" para a UAZAPI
+        "host": host,                # base da UAZAPI (ex: api.uazapi.com)
+        # compat/extra:
+        "instance_token": raw_token,
+        "instance_id": instance_id,  # pode ser None; tudo bem
         "label": (body.label or None),
         "number_hint": (body.number_hint or None),
     }
+
     tok = _jwt_encode(payload)
-    return LoginOut(jwt=tok, profile={"label": payload.get("label"), "number_hint": payload.get("number_hint")})
+
+    # resposta enxuta (profile é só para exibição no front)
+    return LoginOut(
+        jwt=tok,
+        profile={
+            "label": payload.get("label"),
+            "number_hint": payload.get("number_hint"),
+            "host": host,
+            "has_instance_id": bool(instance_id),
+        },
+    )
 
 @router.get("/check")
 def check(user=Depends(get_current_user)):
-    return {"ok": True, "user": {"label": user.get("label"), "number_hint": user.get("number_hint"), "host": user.get("host")}}
+    return {
+        "ok": True,
+        "user": {
+            "host": user.get("host"),
+            "has_instance_id": bool(user.get("instance_id")),
+            "label": user.get("label"),
+            "number_hint": user.get("number_hint"),
+        },
+    }
+
+@router.get("/me")
+def me(user=Depends(get_current_user)):
+    # útil para debug rápido no front
+    return user
 
 @router.get("/debug")
 def debug():
