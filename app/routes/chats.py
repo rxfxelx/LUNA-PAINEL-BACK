@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from app.routes.deps import get_uazapi_ctx
 from app.routes import ai as ai_routes
 from app.routes import crm as crm_module
+from app.routes.deps_billing import require_active_tenant  # <-- NOVO
 
 # DB helpers de lead status
 from app.services.lead_status import (  # type: ignore
@@ -210,6 +211,7 @@ async def find_chats(
     ),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
+    _user=Depends(require_active_tenant),   # <-- BLOQUEIA se assinatura inativa
     ctx=Depends(get_uazapi_ctx),
 ):
     instance_id = _get_instance_id_from_request(request)
@@ -260,16 +262,13 @@ async def find_chats(
                     crm_module.set_status_internal(chatid, st)
                 except Exception:
                     pass
-            # anexa ts normalizado p/ ordenação
             item["_last_ts"] = last_ts
 
         await asyncio.gather(*(worker(it) for it in items))
     else:
-        # mesmo sem classificar, garante o campo de ordenação
         for it in items:
             it["_last_ts"] = _last_msg_ts_of(it)
 
-    # >>> ORDEM GLOBAL POR ÚLTIMA INTERAÇÃO (desc) – igual WhatsApp
     items.sort(key=lambda x: int(x.get("_last_ts") or 0), reverse=True)
 
     return {"items": items}
@@ -282,6 +281,7 @@ async def stream_chats(
     body: dict | None = Body(None),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
+    _user=Depends(require_active_tenant),   # <-- BLOQUEIA se assinatura inativa
     ctx=Depends(get_uazapi_ctx),
 ):
     instance_id = _get_instance_id_from_request(request)
@@ -329,7 +329,6 @@ async def stream_chats(
                 if not chunk:
                     break
 
-                # processa o chunk inteiro, ordena por ts desc e só então emite
                 coros = [process_item(it) for it in chunk]
                 results = []
                 for fut in asyncio.as_completed(coros):
@@ -338,7 +337,6 @@ async def stream_chats(
                     except Exception as e:
                         results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
 
-                # ordena no servidor por última interação
                 for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
                     yield line
                     count += 1
