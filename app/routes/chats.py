@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from typing import Any, Dict, List, Optional
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from fastapi.responses import StreamingResponse
@@ -12,20 +14,27 @@ from app.routes.deps import get_uazapi_ctx
 from app.routes import ai as ai_routes
 from app.routes import crm as crm_module
 
+# DB helpers de lead status
+from app.services.lead_status import (  # type: ignore
+    get_lead_status,
+    upsert_lead_status,
+    should_reclassify,
+)
+
 router = APIRouter()
 
-# ---------------- cache simples p/ classificação ---------------- #
-_CLASSIFY_CACHE: dict[str, tuple[float, str]] = {}  # chatid -> (ts, stage)
+# ---------------- cache simples p/ classificação (protege IA) ---------------- #
+_CLASSIFY_CACHE: dict[str, tuple[float, str]] = {}  # chatid -> (ts_epoch, stage)
 _CLASSIFY_TTL = 300  # 5 minutos
 
 
-def _uaz(ctx):
+def _uaz(ctx: Dict[str, Any]) -> tuple[str, Dict[str, str]]:
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
     return base, headers
 
 
-def _normalize_items(resp_json):
+def _normalize_items(resp_json: Any) -> Dict[str, List[Dict[str, Any]]]:
     if isinstance(resp_json, dict):
         if isinstance(resp_json.get("items"), list):
             return {"items": resp_json["items"]}
@@ -39,31 +48,125 @@ def _normalize_items(resp_json):
     return {"items": []}
 
 
-async def _classify_one(ctx: dict, chatid: str) -> str | None:
-    # cache
+def _pick_chatid(item: Dict[str, Any]) -> str:
+    return (
+        item.get("wa_chatid")
+        or item.get("chatid")
+        or item.get("wa_fastid")
+        or item.get("id")
+        or ""
+    )
+
+
+def _last_msg_ts_of(item: Dict[str, Any]) -> int:
+    # aceita várias chaves possíveis; retorna em epoch ms se possível
+    ts = (
+        item.get("wa_lastMsgTimestamp")
+        or item.get("messageTimestamp")
+        or item.get("updatedAt")
+        or 0
+    )
+    try:
+        n = int(ts)
+    except Exception:
+        return 0
+    # alguns backends podem devolver segundos
+    if len(str(n)) == 10:
+        n = n * 1000
+    return n
+
+
+async def _maybe_classify_and_persist(
+    ctx: Dict[str, Any],
+    chatid: str,
+    last_msg_ts: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Estratégia pedida:
+    - se tiver no banco -> usa e retorna
+    - se não tiver no banco -> classifica e salva
+    - se tiver, mas should_reclassify(instance, chatid, last_msg_ts=...) == True -> reclassifica e salva
+    """
+    instance_id = str(ctx.get("instance_id") or "")
+
+    # 1) tenta banco
+    rec = await get_lead_status(instance_id, chatid)
+    if rec and rec.get("stage"):
+        # decide se precisa reclassificar
+        need = False
+        try:
+            need = await should_reclassify(
+                instance_id,
+                chatid,
+                last_msg_ts=last_msg_ts,
+                last_from_me=None,
+            )
+        except Exception:
+            # se der erro, falamos "não precisa reclassificar" para não travar UX
+            need = False
+
+        if not need:
+            return str(rec["stage"])
+
+    # 2) cache curto (evita bombar IA se várias abas)
     now = time.time()
     hit = _CLASSIFY_CACHE.get(chatid)
-    if hit and now - hit[0] <= _CLASSIFY_TTL:
-        return hit[1]
-    # chama IA com timeout curto (não trava página)
+    if hit and (now - hit[0]) <= _CLASSIFY_TTL:
+        stage_cached = hit[1]
+        # garante persistência caso não tenha sido salvo
+        try:
+            await upsert_lead_status(
+                instance_id,
+                chatid,
+                stage_cached,
+                last_msg_ts=int(last_msg_ts or 0),
+                last_from_me=False,
+            )
+        except Exception:
+            pass
+        return stage_cached
+
+    # 3) classifica com IA
     try:
         res = await asyncio.wait_for(
-            ai_routes.classify_chat(chatid=chatid, persist=True, limit=200, ctx=ctx),
-            timeout=3.0,
+            ai_routes.classify_chat(
+                chatid=chatid, persist=False,  # persistiremos nós
+                limit=200, ctx=ctx
+            ),
+            timeout=3.5,  # timeout curto pra não travar front
         )
         stage = (res or {}).get("stage")
         if stage:
             _CLASSIFY_CACHE[chatid] = (now, stage)
-        return stage
+            # salva no banco
+            try:
+                await upsert_lead_status(
+                    instance_id,
+                    chatid,
+                    stage,
+                    last_msg_ts=int(last_msg_ts or 0),
+                    last_from_me=False,
+                )
+            except Exception:
+                pass
+            return stage
     except Exception:
         return None
+
+    return None
 
 
 # ------------------ Resposta única (paginada) ------------------ #
 @router.post("/chats")
 async def find_chats(
     body: dict | None = Body(None),
-    classify: bool = Query(True, description="Classifica cada chat antes de devolver"),
+    classify: bool = Query(
+        True,
+        description=(
+            "Se True, usa banco quando houver; "
+            "classifica com IA apenas quando não houver registro ou quando precisar reclassificar."
+        ),
+    ),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
     ctx=Depends(get_uazapi_ctx),
@@ -100,17 +203,24 @@ async def find_chats(
     items = items[:max_total]
 
     if classify and items:
-        sem = asyncio.Semaphore(16)  # ↑ concorrência
+        sem = asyncio.Semaphore(16)
+
         async def worker(item: dict):
-            chatid = item.get("wa_chatid") or item.get("chatid") or item.get("wa_fastid") or item.get("id") or ""
+            chatid = _pick_chatid(item)
             if not chatid:
                 return
-            async with sem:
-                st = await _classify_one(ctx, chatid)
+            last_ts = _last_msg_ts_of(item)
+
+            # usa banco se existir; IA só se não houver/precisar
+            st = await _maybe_classify_and_persist(ctx, chatid, last_msg_ts=last_ts)
             if st:
                 item["_stage"] = st
                 item["stage"] = st
-                crm_module.set_status_internal(chatid, st)
+                # tenta atualizar CRM interno sem quebrar resposta
+                try:
+                    crm_module.set_status_internal(chatid, st)
+                except Exception:
+                    pass
 
         await asyncio.gather(*(worker(it) for it in items))
 
@@ -131,19 +241,22 @@ async def stream_chats(
     async def gen():
         count = 0
         offset = 0
-        sem = asyncio.Semaphore(16)  # ↑ concorrência
+        sem = asyncio.Semaphore(16)
 
         async with httpx.AsyncClient(timeout=30) as cli:
 
             async def process_item(item: dict) -> str:
-                chatid = item.get("wa_chatid") or item.get("chatid") or item.get("wa_fastid") or item.get("id") or ""
+                chatid = _pick_chatid(item)
                 if chatid:
-                    async with sem:
-                        st = await _classify_one(ctx, chatid)
+                    last_ts = _last_msg_ts_of(item)
+                    st = await _maybe_classify_and_persist(ctx, chatid, last_msg_ts=last_ts)
                     if st:
                         item["_stage"] = st
                         item["stage"] = st
-                        crm_module.set_status_internal(chatid, st)
+                        try:
+                            crm_module.set_status_internal(chatid, st)
+                        except Exception:
+                            pass
                 return json.dumps(item, ensure_ascii=False) + "\n"
 
             while count < max_total:
@@ -167,7 +280,10 @@ async def stream_chats(
 
                 coros = [process_item(it) for it in chunk]
                 for fut in asyncio.as_completed(coros):
-                    line = await fut
+                    try:
+                        line = await fut
+                    except Exception as e:
+                        line = json.dumps({"error": f"process_item: {e}"}) + "\n"
                     yield line
                     count += 1
                     if count >= max_total:
