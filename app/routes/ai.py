@@ -5,7 +5,7 @@ import asyncio
 import re
 from typing import Any, Dict, List, Optional
 
-import httpx  # <— precisamos buscar mensagens na UAZAPI
+import httpx  # buscar mensagens na UAZAPI
 
 from app.services.lead_status import (  # type: ignore
     upsert_lead_status,
@@ -90,79 +90,98 @@ def _ts_of(m: Dict[str, Any]) -> int:
 
 
 # =========================
-# Regras de classificação
+# Regras de classificação (refinadas)
 # =========================
-WINDOW_DAYS = 21
+# 1) Todo mundo começa "contatos".
+# 2) "lead" quando o CLIENTE aceita/autoriza seguir
+#    (botão/lista com "sim", "pode continuar", "quero saber mais"... ou texto equivalente).
+# 3) "lead_quente" SOMENTE quando NÓS (fromMe=True) falamos em
+#    encaminhar/transferir/colocar em contato/passar número etc.
 
-HOT_STRONG = {
-    "fechar", "fechamos", "fechamento",
-    "pix", "comprovante", "paguei", "pagar", "pagamento", "boleto",
-    "nota fiscal", "nf-e", "nfe",
-    "contrato", "assinar", "assinatura",
-    "endereço", "localização", "location", "mandar localização",
-    "horário", "agendar", "agendamento", "marcar", "marcamos",
-    "entrega hoje", "hoje ainda", "agora", "sim pode ser", "pode ser sim",
-}
+YES_TOKENS = (
+    "sim",
+    "pode continuar",
+    "quero saber mais",
+    "pode prosseguir",
+    "seguir",
+    "continuar",
+    "ok pode",
+    "ok, pode",
+    "ok pode continuar",
+    "aceito",
+    "autorizo",
+)
 
-HOT_PRICE = {"preço", "valor", "quanto", "orçamento", "cotação"}
-
-ONLY_GREETINGS = {
-    "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite",
-    "ok", "blz", "beleza", "certo", "show", "👍", "👋",
-}
-
-MONEY_RE = re.compile(r"(?:\br\$|\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\b|\b\d+[km]\b)", re.I)
-
-
-def _days_between_ms(a_ms: int, b_ms: int) -> float:
-    return abs(a_ms - b_ms) / 86_400_000.0
+HOT_ACTION_PAT = re.compile(
+    r"(vou|vamos)\s*(te\s*)?(encaminhar|transferir|direcionar)|"
+    r"(vou|vamos)\s*(te\s*)?(colocar|por)\s*(em|no)\s*contato|"
+    r"(vou|vamos)\s*passar\s*(seu|o)\s*n[uú]mero|"
+    r"(vou|vamos)\s*(te\s*)?passar\s*(para|pra)\s*(o|a)\s*setor|"
+    r"(te\s*)?coloco\s*(em|no)\s*contato|"
+    r"vou\s*agendar|vou\s*marcar|vou\s*abrir\s*chamado",
+    re.IGNORECASE,
+)
 
 
-def _stage_from_messages(messages: List[Dict[str, Any]]) -> tuple[str, int]:
+def _is_interactive_yes(m: Dict[str, Any]) -> bool:
+    msg = m.get("message") or {}
+    # respostas de botões
+    br = msg.get("buttonsResponseMessage") or {}
+    if any(tok in (br.get("selectedDisplayText") or "").lower() for tok in YES_TOKENS):
+        return True
+    if any(tok in (br.get("selectedButtonId") or "").lower() for tok in YES_TOKENS):
+        return True
+    # respostas de listas
+    lr = msg.get("listResponseMessage") or {}
+    single = (lr.get("singleSelectReply") or {})
+    if any(tok in (single.get("selectedRowId") or "").lower() for tok in YES_TOKENS):
+        return True
+    if any(tok in (lr.get("title") or "").lower() for tok in YES_TOKENS):
+        return True
+    return False
+
+
+def _stage_from_messages(messages: List[Dict[str, Any]]) -> tuple[str, int, bool]:
     """
-    Retorna (stage, last_msg_ts_ms) baseado nas regras.
+    Retorna (stage, last_msg_ts_ms, last_from_me)
+    Regras:
+      - procura de trás pra frente:
+        1) se encontrarmos UMA mensagem NOSSA que contenha ação de encaminhamento => lead_quente
+        2) senão, se encontrarmos UMA mensagem do CLIENTE aceitando (botão/lista) OU texto com YES_TOKENS => lead
+        3) caso contrário => contatos
     """
     if not messages:
-        return "contatos", 0
+        return "contatos", 0, False
 
-    msgs = messages[-40:]
-    now_ms = 0
-    for m in msgs:
-        now_ms = max(now_ms, _ts_of(m))
+    # últimas ~60 mensagens (suficiente e barato)
+    msgs = messages[-60:] if len(messages) > 60 else messages
 
-    score = 0
-    any_real_text = False
-    only_greetings = True
+    # last_ts e quem foi o último a falar
+    try:
+        last = max(msgs, key=_ts_of)
+    except ValueError:
+        last = msgs[-1]
+    last_ts = _ts_of(last)
+    last_from_me = _is_from_me(last)
 
-    for m in msgs:
-        txt_raw = _text_of(m)
-        txt = txt_raw.lower()
-        ts = _ts_of(m)
-        if txt_raw.strip():
-            any_real_text = True
+    # 1) nossa ação explícita => lead_quente
+    for m in reversed(msgs):
+        if _is_from_me(m):
+            txt = _text_of(m)
+            if txt and HOT_ACTION_PAT.search(txt):
+                return "lead_quente", last_ts, last_from_me
 
-        in_window = (_days_between_ms(ts, now_ms) <= WINDOW_DAYS) if now_ms else True
-        from_client = not _is_from_me(m)
+    # 2) aceite do cliente => lead
+    for m in reversed(msgs):
+        if not _is_from_me(m):
+            if _is_interactive_yes(m):
+                return "lead", last_ts, last_from_me
+            txt = _text_of(m).lower()
+            if any(tok in txt for tok in YES_TOKENS):
+                return "lead", last_ts, last_from_me
 
-        if txt and any(w == txt for w in ONLY_GREETINGS):
-            pass
-        else:
-            if txt.strip():
-                only_greetings = False
-
-        if in_window and from_client:
-            if any(k in txt for k in HOT_STRONG):
-                score += 3
-            if any(k in txt for k in HOT_PRICE) or MONEY_RE.search(txt):
-                score += 2
-            if m.get("message", {}).get("listResponseMessage") or m.get("message", {}).get("buttonsResponseMessage"):
-                score += 1
-
-    if score >= 3:
-        return "lead_quente", now_ms
-    if any_real_text and not only_greetings:
-        return "lead", now_ms
-    return "contatos", now_ms
+    # 3) default
+    return "contatos", last_ts, last_from_me
 
 
 # =========================
@@ -194,7 +213,6 @@ async def classify_chat(
     except Exception:
         cur = None
 
-    # por padrão, assume que deve reclassificar quando não temos last_msg_ts novo
     need_reclass = True
     if cur and cur.get("stage"):
         try:
@@ -233,7 +251,7 @@ async def classify_chat(
     elif isinstance(data, list):
         items = data
 
-    stage, last_ts = _stage_from_messages(items)
+    stage, last_ts, last_from_me = _stage_from_messages(items)
     stage = _normalize_stage(stage)
 
     if persist:
@@ -243,7 +261,7 @@ async def classify_chat(
                 chatid,
                 stage,
                 last_msg_ts=int(last_ts or 0),
-                last_from_me=False,
+                last_from_me=bool(last_from_me),
             )
         except Exception:
             pass
@@ -269,7 +287,7 @@ async def classify_by_rules(
     persist: bool = True,
 ) -> Dict[str, Any]:
     msgs = messages or []
-    stage, last_ts = _stage_from_messages(msgs)
+    stage, last_ts, last_from_me = _stage_from_messages(msgs)
     stage = _normalize_stage(stage)
 
     if persist and chatid:
@@ -286,7 +304,7 @@ async def classify_by_rules(
                 chatid,
                 stage,
                 last_msg_ts=int(last_ts or 0),
-                last_from_me=False,
+                last_from_me=bool(last_from_me),
             )
         except Exception:
             pass
