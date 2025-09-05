@@ -112,7 +112,7 @@ YES_TOKENS = (
     "autorizo",
 )
 
-# ✅ regex balanceado
+# Regex balanceada cobrindo ações nossas (encaminhar/transferir etc.)
 HOT_ACTION_PAT = re.compile(
     r"(?:\b(?:vou|vamos)\s*(?:te\s*)?(?:encaminhar|transferir|direcionar)\b"
     r"|(?:vou|vamos)\s*(?:te\s*)?(?:colocar|por)\s*(?:em|no)\s*contato\b"
@@ -156,10 +156,8 @@ def _stage_from_messages(messages: List[Dict[str, Any]]) -> tuple[str, int, bool
     if not messages:
         return "contatos", 0, False
 
-    # últimas ~60 mensagens (suficiente e barato)
     msgs = messages[-60:] if len(messages) > 60 else messages
 
-    # last_ts e quem foi o último a falar
     try:
         last = max(msgs, key=_ts_of)
     except ValueError:
