@@ -114,7 +114,7 @@ YES_TOKENS = (
 
 HOT_ACTION_PAT = re.compile(
     r"(vou|vamos)\s*(te\s*)?(encaminhar|transferir|direcionar)|"
-    r"(vou|vamos)\s*(te\s*)?(colocar|por)\s*(em|no)\s*contato|"
+    r"(vou|vamos)\s*(te\s*)?(colocar|por)\s*(em|no)\s*contato)|"
     r"(vou|vamos)\s*passar\s*(seu|o)\s*n[uú]mero|"
     r"(vou|vamos)\s*(te\s*)?passar\s*(para|pra)\s*(o|a)\s*setor|"
     r"(te\s*)?coloco\s*(em|no)\s*contato|"
