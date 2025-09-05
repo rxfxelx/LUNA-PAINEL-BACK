@@ -1,13 +1,12 @@
+# app/pg.py
 import os
 from psycopg_pool import ConnectionPool
 
 _pool = None
 
-
 def get_pool() -> ConnectionPool:
     """
-    Cria (singleton) um pool de conexões.
-    - Usa configure para ligar autocommit de forma correta.
+    Singleton do pool de conexões (autocommit ligado).
     """
     global _pool
     if _pool is None:
@@ -22,16 +21,19 @@ def get_pool() -> ConnectionPool:
         _pool = ConnectionPool(conninfo=dsn, max_size=size, configure=_configure)
     return _pool
 
+# helper opcional (uso: with get_conn() as con: con.execute(...))
+def get_conn():
+    return get_pool().connection()
 
 def init_schema():
     """
-    Cria/atualiza a tabela lead_status para suportar multi-instância.
-    - adiciona instance_id (se não existir)
-    - migra PK para (instance_id, chatid)
-    - cria índices úteis
+    - Tabela lead_status (já existente) -> garante migrações/índices
+    - **Nova** tabela billing_accounts (trial + cobrança)
     """
     sql = """
-    -- cria tabela caso não exista (estrutura nova)
+    -- =========================================
+    -- LEAD STATUS
+    -- =========================================
     CREATE TABLE IF NOT EXISTS lead_status (
       instance_id   TEXT NOT NULL,
       chatid        TEXT NOT NULL,
@@ -42,7 +44,6 @@ def init_schema():
       PRIMARY KEY (instance_id, chatid)
     );
 
-    -- migração: adicionar coluna instance_id se a tabela antiga existir
     DO $$
     BEGIN
       IF NOT EXISTS (
@@ -54,19 +55,16 @@ def init_schema():
       END IF;
     END$$;
 
-    -- backfill: se veio de schema antigo, garante valor para instance_id
     UPDATE lead_status
        SET instance_id = COALESCE(instance_id, 'legacy')
      WHERE instance_id IS NULL;
 
-    -- garante defaults (idempotente)
     ALTER TABLE lead_status
       ALTER COLUMN stage SET DEFAULT 'contatos',
       ALTER COLUMN updated_at SET DEFAULT NOW(),
       ALTER COLUMN last_msg_ts SET DEFAULT 0,
       ALTER COLUMN last_from_me SET DEFAULT FALSE;
 
-    -- migração da PK: ajusta para (instance_id, chatid)
     DO $$
     BEGIN
       IF EXISTS (
@@ -75,14 +73,11 @@ def init_schema():
       ) THEN
         ALTER TABLE lead_status DROP CONSTRAINT IF EXISTS lead_status_pkey;
       END IF;
-
-      -- pode falhar se houver linhas sem instance_id (tratado pelo backfill acima)
       BEGIN
         ALTER TABLE lead_status ALTER COLUMN instance_id SET NOT NULL;
       EXCEPTION WHEN others THEN
         NULL;
       END;
-
       BEGIN
         ALTER TABLE lead_status ADD PRIMARY KEY (instance_id, chatid);
       EXCEPTION WHEN others THEN
@@ -90,12 +85,30 @@ def init_schema():
       END;
     END$$;
 
-    -- índices
     CREATE INDEX IF NOT EXISTS idx_lead_status_stage          ON lead_status(stage);
     CREATE INDEX IF NOT EXISTS idx_lead_status_updated_at     ON lead_status(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_lead_status_last_msg_ts    ON lead_status(last_msg_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_lead_status_inst_stage     ON lead_status(instance_id, stage);
     CREATE INDEX IF NOT EXISTS idx_lead_status_inst_last_ts   ON lead_status(instance_id, last_msg_ts DESC);
+
+    -- =========================================
+    -- BILLING / ASSINATURAS
+    -- =========================================
+    CREATE TABLE IF NOT EXISTS billing_accounts (
+      id                  SERIAL PRIMARY KEY,
+      billing_key         TEXT UNIQUE NOT NULL,   -- iid:<uuid> OU hash(host|token)
+      instance_id         TEXT,
+      host                TEXT,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      trial_started_at    TIMESTAMPTZ,
+      trial_ends_at       TIMESTAMPTZ,
+      paid_until          TIMESTAMPTZ,
+      plan                TEXT,
+      last_payment_status TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_billing_paid_until ON billing_accounts(paid_until DESC);
+    CREATE INDEX IF NOT EXISTS idx_billing_trial_ends ON billing_accounts(trial_ends_at DESC);
     """
     with get_pool().connection() as con:
         con.execute(sql)
