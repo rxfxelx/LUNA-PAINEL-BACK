@@ -42,7 +42,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def _startup():
     logger = logging.getLogger("uvicorn.error")
-    logger.info("Inicializando Luna Backend...")
+    logger.info("Inicializando Luna Backend.")
 
     db_url = os.getenv("DATABASE_URL") or ""
     if not db_url:
@@ -65,18 +65,10 @@ app.include_router(auth_router,           prefix="/api/auth",   tags=["auth"])
 app.include_router(chats.router,          prefix="/api",        tags=["chats"])
 app.include_router(messages.router,       prefix="/api",        tags=["messages"])
 app.include_router(send.router,           prefix="/api",        tags=["send"])
-app.include_router(realtime.router,       prefix="/api",        tags=["sse"])
+app.include_router(realtime.router,       prefix="/api",        tags=["realtime"])
 app.include_router(meta.router,           prefix="/api",        tags=["meta"])
 app.include_router(name_image.router,     prefix="/api",        tags=["name-image"])
-
-# CRM
-app.include_router(crm.router,            prefix="/api/crm",    tags=["crm"])
-
-# IA
+app.include_router(crm.router,            prefix="/api",        tags=["crm"])
 app.include_router(ai.router,             prefix="/api",        tags=["ai"])
-
-# MEDIA  (router já tem prefixo /api/media dentro do arquivo)
-app.include_router(media.router)
-
-# Lead status cache (router sem prefixo interno; aqui aplicamos /api)
+app.include_router(media.router,          prefix="/api/media",  tags=["media"])
 app.include_router(lead_status.router,    prefix="/api",        tags=["lead-status"])
