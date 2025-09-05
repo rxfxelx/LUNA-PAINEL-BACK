@@ -1,6 +1,8 @@
 # app/routes/name_image.py
+import json
+import hashlib
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Body, Response
+from fastapi import APIRouter, Depends, HTTPException, Body, Response, Request
 from app.routes.deps import get_uazapi_ctx  # mesmo deps usado nas outras rotas
 
 router = APIRouter()
@@ -20,7 +22,6 @@ def _normalize(resp: dict) -> dict:
     """
     Normaliza a resposta da UAZAPI para sempre conter:
       { "name": str|None, "image": str|None, "imagePreview": str|None }
-    (sem quebrar se vierem chaves diferentes)
     """
     if not isinstance(resp, dict):
         return {"name": None, "image": None, "imagePreview": None}
@@ -66,8 +67,32 @@ def _payload_is_url_expired(res: httpx.Response) -> bool:
     return "url signature expired" in txt
 
 
+# -------- Helpers de resposta cacheável --------
+def _etag_for(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    h = hashlib.sha1(raw).hexdigest()
+    return f'W/"{h}"'  # weak etag é suficiente
+
+def _cacheable_json_response(request: Request, payload: dict, ttl: int) -> Response:
+    etag = _etag_for(payload)
+    inm = request.headers.get("if-none-match")
+    if inm and inm == etag:
+        resp = Response(status_code=304)
+    else:
+        resp = Response(
+            content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            media_type="application/json",
+            status_code=200,
+        )
+    resp.headers["ETag"] = etag
+    # permitir reuso pelo navegador e CDNs; SWR ajuda a suavizar picos
+    resp.headers["Cache-Control"] = f"public, max-age={ttl}, stale-while-revalidate={ttl}"
+    return resp
+
+
 @router.post("/name-image")
 async def get_name_and_image(
+    request: Request,
     payload: dict = Body(..., example={"number": "5531999999999@s.whatsapp.net", "preview": True}),
     ctx=Depends(get_uazapi_ctx),
 ):
@@ -77,10 +102,15 @@ async def get_name_and_image(
       - /chat/GetNameAndImageUrl
       - /chat/getNameAndImageURL
       - /chat/getNameAndImageUrl
-      - /chat/GetNameAndImage      (algumas instâncias)
+      - /chat/GetNameAndImage
       - /chat/getNameAndImage
+
     Body esperado:
       { "number": "<wa_chatid ou número>", "preview": true|false }
+
+    Respostas possuem Cache-Control + ETag:
+      - Sucesso:   max-age=86400 (24h)
+      - Upstream “URL signature expired”: max-age=300 (5min)  -> evita martelar a API
     """
     number = (payload.get("number") or "").strip()
     preview = bool(payload.get("preview", True))
@@ -118,13 +148,9 @@ async def get_name_and_image(
             if 200 <= r.status_code < 300:
                 # Pode vir 200 com texto "URL signature expired" ou payload não-JSON
                 if _payload_is_url_expired(r):
-                    # Devolve um normalizado "vazio" para o front cair no fallback e tentar depois
-                    resp = Response(
-                        content='{"name":null,"image":null,"imagePreview":null}',
-                        media_type="application/json",
-                    )
-                    resp.headers["Cache-Control"] = "no-store"
-                    return resp
+                    payload_null = {"name": None, "image": None, "imagePreview": None}
+                    # TTL curto para não "congelar" vazio por muito tempo
+                    return _cacheable_json_response(request, payload_null, ttl=300)
 
                 try:
                     data = r.json()
@@ -132,9 +158,8 @@ async def get_name_and_image(
                     raise HTTPException(status_code=502, detail="Resposta inválida da UAZAPI em name-image")
 
                 norm = _normalize(data)
-                resp = Response(content=httpx.Response(200, json=norm).content, media_type="application/json")
-                resp.headers["Cache-Control"] = "no-store"
-                return resp
+                # sucesso normal: TTL de 24h
+                return _cacheable_json_response(request, norm, ttl=86400)
 
             if r.status_code in (404, 405):
                 continue  # tenta próxima rota
