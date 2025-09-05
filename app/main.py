@@ -1,129 +1,352 @@
-# app/main.py
-import os
-import logging
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+# app/routes/chats.py
+from __future__ import annotations
 
-# Rotas internas
-from .routes import (
-    chats,
-    messages,
-    send,
-    realtime,
-    meta,
-    name_image,
-    crm,
-    media,
-    lead_status,
-)
-from .auth import router as auth_router  # /api/auth/*
-from .pg import init_schema
+import asyncio
+import json
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
+from fastapi.responses import StreamingResponse
 
-# ----------------------------- CORS ------------------------------------ #
-def _env_list(var: str) -> list[str]:
-    raw = (os.getenv(var) or "").strip()
-    if not raw:
-        return []
-    return [v.strip() for v in raw.split(",") if v.strip()]
+from app.routes.deps import get_uazapi_ctx
+from app.routes import ai as ai_routes
+from app.routes import crm as crm_module
 
-def allowed_origins() -> list[str]:
-    """
-    Lista de origens explícitas (sem regex). Use FRONTEND_ORIGIN para acrescentar.
-    """
-    allowlist: set[str] = {
-        # Domínio oficial
-        "https://www.lunahia.com.br",
-        "https://lunahia.com.br",
-        # Deploy Vercel atual
-        "https://luna-painel-front-git-main-iahelsenservice-7497s-projects.vercel.app",
-    }
-
-    # Extras via env (separar por vírgula)
-    for o in _env_list("FRONTEND_ORIGIN"):
-        allowlist.add(o)
-
-    # Dev local (habilite via ALLOW_LOCALHOST=1)
-    if os.getenv("ALLOW_LOCALHOST", "1") == "1":
-        allowlist.update(
-            {
-                "http://localhost:3000",
-                "http://127.0.0.1:3000",
-                "http://localhost:5173",
-                "http://127.0.0.1:5173",
-            }
-        )
-
-    return sorted(allowlist)
-
-def allowed_origin_regex() -> str | None:
-    """
-    Regex opcional para subdomínios, via FRONTEND_ORIGIN_REGEX.
-    Ex.: https://([a-z0-9-]+\.)*lunahia\.com\.br$
-    """
-    rx = (os.getenv("FRONTEND_ORIGIN_REGEX") or "").strip()
-    return rx or None
-
-
-app = FastAPI(title="Luna Backend", version="1.0.0")
-
-# CORS — aceita lista e/ou regex (FastAPI permite um único regex)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins(),
-    allow_origin_regex=allowed_origin_regex(),
-    allow_credentials=True,
-    allow_methods=["*"],            # libera todos os métodos (inclui OPTIONS p/ preflight)
-    allow_headers=["*"],            # inclui Authorization
-    expose_headers=["*"],           # opcional: expõe todos
-    max_age=86400,                  # cacheia preflight por 1 dia
+# DB helpers de lead status
+from app.services.lead_status import (  # type: ignore
+    get_lead_status,
+    upsert_lead_status,
+    should_reclassify,
 )
 
+router = APIRouter()
 
-# --------------------------- Startup ----------------------------------- #
-@app.on_event("startup")
-async def _startup():
-    logger = logging.getLogger("uvicorn.error")
-    logger.info("Inicializando Luna Backend.")
+# ---------------- util: extrai instance_id do JWT/headers ---------------- #
+def _b64url_to_bytes(s: str) -> bytes:
+    import base64
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
 
-    # Log de CORS (útil para depuração)
-    logger.info("CORS allow_origins: %s", allowed_origins())
-    logger.info("CORS allow_origin_regex: %s", allowed_origin_regex())
+def _get_instance_id_from_request(req: Request) -> str:
+    # 1) se um middleware já setou
+    inst = getattr(req.state, "instance_id", None)
+    if inst:
+        return str(inst)
 
-    db_url = os.getenv("DATABASE_URL") or ""
-    if not db_url:
-        logger.error(
-            "DATABASE_URL não definido! Defina a variável de ambiente para conectar ao Postgres."
-        )
-    else:
-        safe_db = db_url.split("@")[-1]
-        logger.info("DATABASE_URL detectado (host/db: %s)", safe_db)
+    # 2) header auxiliar
+    h = req.headers.get("x-instance-id")
+    if h:
+        return str(h)
 
+    # 3) decodifica JWT sem verificar assinatura
+    auth = req.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        parts = token.split(".")
+        if len(parts) >= 2:
+            try:
+                import json as _json
+                payload = _json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
+                return str(
+                    payload.get("instance_id")
+                    or payload.get("phone_number_id")
+                    or payload.get("pnid")
+                    or payload.get("sub")
+                    or ""
+                )
+            except Exception:
+                pass
+    return ""
+
+# ---------------- cache simples p/ classificação (protege IA) ---------------- #
+_CLASSIFY_CACHE: dict[str, tuple[float, str]] = {}  # chatid -> (ts_epoch, stage)
+_CLASSIFY_TTL = 300  # 5 minutos
+
+
+def _uaz(ctx: Dict[str, Any]) -> tuple[str, Dict[str, str]]:
+    base = f"https://{ctx['host']}"
+    headers = {"token": ctx["token"]}
+    return base, headers
+
+
+def _normalize_items(resp_json: Any) -> Dict[str, List[Dict[str, Any]]]:
+    if isinstance(resp_json, dict):
+        if isinstance(resp_json.get("items"), list):
+            return {"items": resp_json["items"]}
+        for key in ("data", "results", "chats"):
+            val = resp_json.get(key)
+            if isinstance(val, list):
+                return {"items": val}
+        return {"items": []}
+    if isinstance(resp_json, list):
+        return {"items": resp_json}
+    return {"items": []}
+
+
+def _pick_chatid(item: Dict[str, Any]) -> str:
+    return (
+        item.get("wa_chatid")
+        or item.get("chatid")
+        or item.get("wa_fastid")
+        or item.get("id")
+        or ""
+    )
+
+
+def _last_msg_ts_of(item: Dict[str, Any]) -> int:
+    """Retorna ts em milissegundos (aceita segundos)."""
+    ts = (
+        item.get("wa_lastMsgTimestamp")
+        or item.get("messageTimestamp")
+        or item.get("updatedAt")
+        or 0
+    )
     try:
-        init_schema()
-        logger.info("Schema 'lead_status' verificado/criado com sucesso.")
+        n = int(ts)
     except Exception:
-        logger.exception("Falha ao inicializar schema do banco.")
+        return 0
+    s = str(abs(n))
+    if len(s) == 10:  # epoch s
+        n *= 1000
+    return n
 
 
-# ---------------------------- Rotas ------------------------------------ #
-# Auth
-app.include_router(auth_router,        prefix="/api/auth",   tags=["auth"])
+async def _maybe_classify_and_persist(
+    instance_id: str,
+    ctx: Dict[str, Any],
+    chatid: str,
+    last_msg_ts: Optional[int] = None,
+) -> Optional[str]:
+    """
+    Estratégia:
+    - Se tiver no banco -> usa e retorna
+    - Se tiver e should_reclassify(...) == False -> não mexe
+    - Se não tiver ou precisar reclassificar -> IA e salva
+    """
+    if not instance_id:
+        return None
 
-# Core
-app.include_router(chats.router,       prefix="/api",        tags=["chats"])
-app.include_router(messages.router,    prefix="/api",        tags=["messages"])
-app.include_router(send.router,        prefix="/api",        tags=["send"])
-app.include_router(realtime.router,    prefix="/api",        tags=["realtime"])
-app.include_router(meta.router,        prefix="/api",        tags=["meta"])
-app.include_router(name_image.router,  prefix="/api",        tags=["name-image"])
-app.include_router(crm.router,         prefix="/api",        tags=["crm"])
-# (não incluir ai.router: app/routes/ai.py não define APIRouter)
-app.include_router(media.router,       prefix="/api/media",  tags=["media"])
-app.include_router(lead_status.router, prefix="/api",        tags=["lead-status"])
+    # 1) tenta banco
+    try:
+        rec = await get_lead_status(instance_id, chatid)
+    except Exception:
+        rec = None
+
+    if rec and rec.get("stage"):
+        try:
+            need = await should_reclassify(
+                instance_id,
+                chatid,
+                last_msg_ts=last_msg_ts,
+                last_from_me=None,
+            )
+        except Exception:
+            need = False
+
+        if not need:
+            return str(rec["stage"])
+
+    # 2) cache curto (evita bombar IA)
+    now = time.time()
+    hit = _CLASSIFY_CACHE.get(chatid)
+    if hit and (now - hit[0]) <= _CLASSIFY_TTL:
+        stage_cached = hit[1]
+        try:
+            await upsert_lead_status(
+                instance_id,
+                chatid,
+                stage_cached,
+                last_msg_ts=int(last_msg_ts or 0),
+                last_from_me=False,
+            )
+        except Exception:
+            pass
+        return stage_cached
+
+    # 3) classifica com IA (timeout curto)
+    try:
+        res = await asyncio.wait_for(
+            ai_routes.classify_chat(
+                chatid=chatid,
+                persist=False,  # persistiremos nós
+                limit=200,
+                ctx=ctx,
+            ),
+            timeout=3.5,
+        )
+        stage = (res or {}).get("stage")
+        if stage:
+            _CLASSIFY_CACHE[chatid] = (now, stage)
+            try:
+                await upsert_lead_status(
+                    instance_id,
+                    chatid,
+                    stage,
+                    last_msg_ts=int(last_msg_ts or 0),
+                    last_from_me=False,
+                )
+            except Exception:
+                pass
+            return stage
+    except Exception:
+        return None
+
+    return None
 
 
-# Healthcheck simples (útil no Railway)
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
+# ------------------ Resposta única (paginada) ------------------ #
+@router.post("/chats")
+async def find_chats(
+    request: Request,
+    body: dict | None = Body(None),
+    classify: bool = Query(
+        True,
+        description=(
+            "Se True, usa banco quando houver; "
+            "classifica com IA apenas quando não houver registro ou quando precisar reclassificar."
+        ),
+    ),
+    page_size: int = Query(100, ge=1, le=500),
+    max_total: int = Query(5000, ge=1, le=20000),
+    ctx=Depends(get_uazapi_ctx),
+):
+    instance_id = _get_instance_id_from_request(request)
+    base, headers = _uaz(ctx)
+    url = f"{base}/chat/find"
+
+    items: list[dict] = []
+    offset = 0
+
+    async with httpx.AsyncClient(timeout=30) as cli:
+        while len(items) < max_total:
+            payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+            payload = {**payload, "limit": page_size, "offset": offset}
+
+            r = await cli.post(url, json=payload, headers=headers)
+            if r.status_code >= 400:
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+
+            try:
+                data = r.json()
+            except Exception:
+                raise HTTPException(502, "Resposta inválida da UAZAPI em /chat/find")
+
+            chunk = _normalize_items(data)["items"]
+            if not chunk:
+                break
+
+            items.extend(chunk)
+            if len(chunk) < page_size:
+                break
+            offset += page_size
+
+    items = items[:max_total]
+
+    if classify and items:
+        sem = asyncio.Semaphore(16)
+
+        async def worker(item: dict):
+            chatid = _pick_chatid(item)
+            if not chatid:
+                return
+            last_ts = _last_msg_ts_of(item)
+            st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
+            if st:
+                item["_stage"] = st
+                item["stage"] = st
+                try:
+                    crm_module.set_status_internal(chatid, st)
+                except Exception:
+                    pass
+            # anexa ts normalizado p/ ordenação
+            item["_last_ts"] = last_ts
+
+        await asyncio.gather(*(worker(it) for it in items))
+    else:
+        # mesmo sem classificar, garante o campo de ordenação
+        for it in items:
+            it["_last_ts"] = _last_msg_ts_of(it)
+
+    # >>> ORDEM GLOBAL POR ÚLTIMA INTERAÇÃO (desc) – igual WhatsApp
+    items.sort(key=lambda x: int(x.get("_last_ts") or 0), reverse=True)
+
+    return {"items": items}
+
+
+# ------------------ Stream NDJSON ------------------ #
+@router.post("/chats/stream")
+async def stream_chats(
+    request: Request,
+    body: dict | None = Body(None),
+    page_size: int = Query(100, ge=1, le=500),
+    max_total: int = Query(5000, ge=1, le=20000),
+    ctx=Depends(get_uazapi_ctx),
+):
+    instance_id = _get_instance_id_from_request(request)
+    base, headers = _uaz(ctx)
+    url = f"{base}/chat/find"
+
+    async def gen():
+        count = 0
+        offset = 0
+        sem = asyncio.Semaphore(16)
+
+        async with httpx.AsyncClient(timeout=30) as cli:
+
+            async def process_item(item: dict) -> Tuple[int, str]:
+                chatid = _pick_chatid(item)
+                last_ts = _last_msg_ts_of(item)
+                if chatid:
+                    st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
+                    if st:
+                        item["_stage"] = st
+                        item["stage"] = st
+                        try:
+                            crm_module.set_status_internal(chatid, st)
+                        except Exception:
+                            pass
+                item["_last_ts"] = last_ts
+                return last_ts, json.dumps(item, ensure_ascii=False) + "\n"
+
+            while count < max_total:
+                payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+                payload = {**payload, "limit": page_size, "offset": offset}
+
+                r = await cli.post(url, json=payload, headers=headers)
+                if r.status_code >= 400:
+                    yield json.dumps({"error": r.text}) + "\n"
+                    return
+
+                try:
+                    data = r.json()
+                except Exception:
+                    yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\n"
+                    return
+
+                chunk = _normalize_items(data)["items"]
+                if not chunk:
+                    break
+
+                # processa o chunk inteiro, ordena por ts desc e só então emite
+                coros = [process_item(it) for it in chunk]
+                results = []
+                for fut in asyncio.as_completed(coros):
+                    try:
+                        results.append(await fut)
+                    except Exception as e:
+                        results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
+
+                # ordena no servidor por última interação
+                for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
+                    yield line
+                    count += 1
+                    if count >= max_total:
+                        break
+
+                if len(chunk) < page_size or count >= max_total:
+                    break
+                offset += page_size
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
