@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 
 from app.routes.deps import get_uazapi_ctx
+from app.routes.deps_billing import require_active_tenant  # <-- NOVO
 
 # lead_status (persistência)
 from app.services.lead_status import (  # type: ignore
@@ -78,7 +79,7 @@ def _normalize_items(resp_json):
     return {"items": []}
 
 
-# -------- fallback simples (caso não exista app.routes.ai.classify_stage) ----------
+# -------- fallback simples ----------
 def _fallback_classify_stage(items: List[Dict[str, Any]]) -> str:
     HOT = ("fechar", "fechamos", "pix", "pagar", "preço", "valor", "contrato", "assinar")
     text_fields = (
@@ -130,7 +131,7 @@ async def _classify_stage(items: List[Dict[str, Any]]) -> str:
     return _fallback_classify_stage(items)
 
 
-# -------- helpers p/ ts e autoria (fromMe) ----------
+# -------- helpers p/ ts e autoria ----------
 def _ts_of(m: Dict[str, Any]) -> int:
     ts = m.get("messageTimestamp") or m.get("timestamp") or m.get("t") or m.get("message", {}).get("messageTimestamp") or 0
     try:
@@ -155,7 +156,12 @@ def _is_from_me(m: Dict[str, Any]) -> bool:
 
 
 @router.post("/messages")
-async def find_messages(request: Request, body: dict | None = Body(None), ctx=Depends(get_uazapi_ctx)):
+async def find_messages(
+    request: Request,
+    body: dict | None = Body(None),
+    _user=Depends(require_active_tenant),  # <-- BLOQUEIA se assinatura inativa
+    ctx=Depends(get_uazapi_ctx),
+):
     """
     Proxy para UAZAPI /message/find.
     Além de devolver normalizado, calcula `stage` e PERSISTE em lead_status quando:
@@ -214,15 +220,12 @@ async def find_messages(request: Request, body: dict | None = Body(None), ctx=De
                 instance_id, chatid, last_msg_ts=last_ts, last_from_me=last_from_me
             )
         except Exception:
-            # em erro, evitamos bloquear: não reclassifica à força
             need_reclass = False
         if not need_reclass:
             stage = str(rec["stage"])
 
     if stage is None:
-        # classifica (IA oficial se houver; fallback se não)
         stage = await _classify_stage(items)
-        # persiste (se tivermos instance_id)
         if instance_id:
             try:
                 await upsert_lead_status(
