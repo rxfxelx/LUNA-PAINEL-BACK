@@ -75,7 +75,6 @@ async def get_one(request: Request, chatid: str = Query(..., min_length=1)):
     if not instance_id:
         raise HTTPException(401, "JWT sem instance_id")
 
-    # precisa de await
     rec = await getCachedLeadStatus(instance_id, chatid)
     if not rec:
         return {"found": False}
@@ -102,7 +101,6 @@ async def get_bulk(request: Request, payload: Dict[str, Any] = Body(...)):
     # log pra confirmar chegada do bulk
     log.info("lead-status/bulk req: instance=%s, qtd=%d", instance_id, len(dedup))
 
-    # precisa de await
     items = await getCachedLeadStatusBulk(instance_id, dedup)
     return {
         "items": items,
