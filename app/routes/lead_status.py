@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Dict, Any, List
 from fastapi import APIRouter, Query, Body, HTTPException, Request
 import logging
+import base64
+import json
 
 # tenta importar a versão bulk do service (assíncrona)
 try:
@@ -31,7 +33,6 @@ log = logging.getLogger("uvicorn.error")
 
 # ---------------- util: extrai instance_id do JWT sem dependências externas
 def _b64url_to_bytes(s: str) -> bytes:
-    import base64
     pad = "=" * ((4 - len(s) % 4) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
@@ -54,26 +55,28 @@ def _get_instance_id_from_request(req: Request) -> str:
         parts = token.split(".")
         if len(parts) >= 2:
             try:
-                import json
                 payload = json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
-                return str(
+                val = (
                     payload.get("instance_id")
                     or payload.get("phone_number_id")
                     or payload.get("pnid")
                     or payload.get("sub")
                     or ""
                 )
+                if val:
+                    return str(val)
             except Exception:
                 pass
-    return ""
+
+    # 4) fallback controlado para não quebrar chamadas do front
+    log.warning("lead-status: request sem instance_id; usando fallback 'default'.")
+    return "default"
 
 
 # ---------------- endpoints
 @router.get("/lead-status")
 async def get_one(request: Request, chatid: str = Query(..., min_length=1)):
     instance_id = _get_instance_id_from_request(request)
-    if not instance_id:
-        raise HTTPException(401, "JWT sem instance_id")
 
     rec = await getCachedLeadStatus(instance_id, chatid)
     if not rec:
@@ -86,15 +89,14 @@ async def get_one(request: Request, chatid: str = Query(..., min_length=1)):
 @router.post("/lead-status/bulk")
 async def get_bulk(request: Request, payload: Dict[str, Any] = Body(...)):
     instance_id = _get_instance_id_from_request(request)
-    if not instance_id:
-        raise HTTPException(401, "JWT sem instance_id")
 
-    chatids: List[str] = payload.get("chatids") or []
-    if not isinstance(chatids, list) or not all(isinstance(c, str) and c.strip() for c in chatids):
+    # aceita "chatids" ou "ids" por compatibilidade
+    raw_ids = payload.get("chatids") or payload.get("ids") or []
+    if not isinstance(raw_ids, list) or not all(isinstance(c, str) and c.strip() for c in raw_ids):
         raise HTTPException(400, "chatids inválido")
 
     # saneia/limita para evitar abuso
-    dedup = list(dict.fromkeys([c.strip() for c in chatids if c.strip()]))
+    dedup = list(dict.fromkeys([c.strip() for c in raw_ids if c.strip()]))
     if len(dedup) > 2000:
         dedup = dedup[:2000]
 
