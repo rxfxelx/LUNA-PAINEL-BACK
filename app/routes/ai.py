@@ -5,15 +5,17 @@ import asyncio
 import re
 from typing import Any, Dict, List, Optional
 
+import httpx  # <— precisamos buscar mensagens na UAZAPI
+
 from app.services.lead_status import (  # type: ignore
     upsert_lead_status,
     should_reclassify,
     get_lead_status,
 )
 
-# ------------------------------------------------------------------
-# Normalização de estágio
-# ------------------------------------------------------------------
+# =========================
+# Normalização / utilitários
+# =========================
 def _normalize_stage(s: str) -> str:
     s = (s or "").strip().lower()
     if s.startswith("contato"):
@@ -24,82 +26,148 @@ def _normalize_stage(s: str) -> str:
         return "lead"
     return "contatos"
 
-def _last_ts_guard(ts: Optional[int]) -> int:
+
+def _to_ms(ts: Optional[int | str]) -> int:
     try:
         n = int(ts or 0)
     except Exception:
         return 0
-    # aceita epoch em segundos
-    if len(str(abs(n))) == 10:
+    if len(str(abs(n))) == 10:  # epoch s
         n *= 1000
     return n
 
-# ------------------------------------------------------------------
-# Heurística simples (placeholder)
-# ------------------------------------------------------------------
-_LEAD_QUENTE_PAT = re.compile(
-    r"\b(fechar|fechamos|contratar|contrato|comprar|pag(ar|amento)|boleto|pix|"
-    r"cart[aã]o|assinar|onde assino|quando posso|vamos fechar|quero fechar|"
-    r"manda a fatura|emite.*nota|nota fiscal|NF)\b",
-    re.IGNORECASE,
-)
 
-_LEAD_PAT = re.compile(
-    r"\b(interesse|tenho interesse|quero saber|mais informa[cç][oõ]es?|"
-    r"como funciona|pre[cç]o|valor(es)?|quanto custa|planos?|pacotes?)\b",
-    re.IGNORECASE,
-)
+def _is_from_me(m: Dict[str, Any]) -> bool:
+    return bool(
+        m.get("fromMe")
+        or m.get("fromme")
+        or m.get("from_me")
+        or (isinstance(m.get("key"), dict) and m["key"].get("fromMe"))
+        or (
+            isinstance(m.get("message"), dict)
+            and isinstance(m["message"].get("key"), dict)
+            and m["message"]["key"].get("fromMe")
+        )
+        or (isinstance(m.get("sender"), dict) and m["sender"].get("fromMe"))
+        or (isinstance(m.get("id"), str) and m["id"].startswith("true_"))
+        or m.get("user") == "me"
+    )
 
-def _extract_plain_text(m: Dict[str, Any]) -> str:
+
+def _text_of(m: Dict[str, Any]) -> str:
     mm = m.get("message") or {}
-    return (
-        m.get("text")
-        or m.get("caption")
-        or mm.get("text")
-        or (mm.get("extendedTextMessage") or {}).get("text")
-        or mm.get("conversation")
-        or m.get("body")
-        or ""
-    ) or ""
+    for path in (
+        ("text",),
+        ("caption",),
+        ("body",),
+        ("message", "text"),
+        ("message", "conversation"),
+        ("message", "extendedTextMessage", "text"),
+        ("message", "imageMessage", "caption"),
+        ("message", "videoMessage", "caption"),
+        ("message", "documentMessage", "caption"),
+    ):
+        cur: Any = m
+        ok = True
+        for k in path:
+            if not isinstance(cur, dict) or k not in cur:
+                ok = False
+                break
+            cur = cur[k]
+        if ok and isinstance(cur, str) and cur.strip():
+            return cur.strip()
+    return ""
 
-def _heuristic_from_messages(messages: List[Dict[str, Any]]) -> str:
+
+def _ts_of(m: Dict[str, Any]) -> int:
+    return _to_ms(
+        m.get("messageTimestamp")
+        or m.get("timestamp")
+        or m.get("t")
+        or (m.get("message") or {}).get("messageTimestamp")
+        or 0
+    )
+
+
+# =========================
+# Regras de classificação
+# =========================
+WINDOW_DAYS = 21
+
+HOT_STRONG = {
+    "fechar", "fechamos", "fechamento",
+    "pix", "comprovante", "paguei", "pagar", "pagamento", "boleto",
+    "nota fiscal", "nf-e", "nfe",
+    "contrato", "assinar", "assinatura",
+    "endereço", "localização", "location", "mandar localização",
+    "horário", "agendar", "agendamento", "marcar", "marcamos",
+    "entrega hoje", "hoje ainda", "agora", "sim pode ser", "pode ser sim",
+}
+
+HOT_PRICE = {"preço", "valor", "quanto", "orçamento", "cotação"}
+
+ONLY_GREETINGS = {
+    "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite",
+    "ok", "blz", "beleza", "certo", "show", "👍", "👋",
+}
+
+MONEY_RE = re.compile(r"(?:\br\$|\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\b|\b\d+[km]\b)", re.I)
+
+
+def _days_between_ms(a_ms: int, b_ms: int) -> float:
+    return abs(a_ms - b_ms) / 86_400_000.0
+
+
+def _stage_from_messages(messages: List[Dict[str, Any]]) -> tuple[str, int]:
     """
-    Regras simples em cima do texto das mensagens.
-    Se encontrar termos "quentes", marca como lead_quente; senão, se achar interesse,
-    marca como lead; fallback: contatos.
+    Retorna (stage, last_msg_ts_ms) baseado nas regras.
     """
-    # Examina últimas ~60 mensagens (se vier muita coisa)
-    msgs = messages[-60:] if len(messages) > 60 else messages
-    found_lead_quente = False
-    found_lead = False
+    if not messages:
+        return "contatos", 0
+
+    msgs = messages[-40:]
+    now_ms = 0
+    for m in msgs:
+        now_ms = max(now_ms, _ts_of(m))
+
+    score = 0
+    any_real_text = False
+    only_greetings = True
 
     for m in msgs:
-        txt = _extract_plain_text(m)
-        if not txt:
-            continue
-        if _LEAD_QUENTE_PAT.search(txt):
-            found_lead_quente = True
-            break
-        if _LEAD_PAT.search(txt):
-            found_lead = True
+        txt_raw = _text_of(m)
+        txt = txt_raw.lower()
+        ts = _ts_of(m)
+        if txt_raw.strip():
+            any_real_text = True
 
-    if found_lead_quente:
-        return "lead_quente"
-    if found_lead:
-        return "lead"
-    return "contatos"
+        in_window = (_days_between_ms(ts, now_ms) <= WINDOW_DAYS) if now_ms else True
+        from_client = not _is_from_me(m)
 
-async def _heuristic_stage(chatid: str, ctx: Dict[str, Any] | None = None, limit: int = 200) -> str:
-    """
-    Placeholder para quando não houver classificador externo plugado.
-    Aqui você pode integrar sua IA/serviço real.
-    """
-    await asyncio.sleep(0)
-    return "contatos"
+        if txt and any(w == txt for w in ONLY_GREETINGS):
+            pass
+        else:
+            if txt.strip():
+                only_greetings = False
 
-# ------------------------------------------------------------------
-# API pública usada pelos outros módulos
-# ------------------------------------------------------------------
+        if in_window and from_client:
+            if any(k in txt for k in HOT_STRONG):
+                score += 3
+            if any(k in txt for k in HOT_PRICE) or MONEY_RE.search(txt):
+                score += 2
+            if m.get("message", {}).get("listResponseMessage") or m.get("message", {}).get("buttonsResponseMessage"):
+                score += 1
+
+    if score >= 3:
+        return "lead_quente", now_ms
+    if any_real_text and not only_greetings:
+        return "lead", now_ms
+    return "contatos", now_ms
+
+
+# =========================
+# API pública (usada pelas rotas)
+# =========================
 async def classify_chat(
     chatid: str,
     persist: bool = True,
@@ -107,36 +175,65 @@ async def classify_chat(
     ctx: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
-    Retorna {"stage": "..."}.
-    - Se já existir no banco e NÃO precisar reclassificar, devolve o salvo.
-    - Caso precise (ou não exista), usa a heurística/IA e persiste se `persist=True`.
+    Retorna {"stage": "..."} usando:
+    - Banco (se existir e NÃO precisar reclassificar);
+    - Caso contrário, busca mensagens na UAZAPI, aplica regra e persiste (se persist=True).
     """
-    instance_id = str((ctx or {}).get("instance_id") or "")
+    ctx = ctx or {}
+    instance_id = str(
+        ctx.get("instance_id")
+        or ctx.get("phone_number_id")
+        or ctx.get("pnid")
+        or ctx.get("sub")
+        or ""
+    )
 
-    # tenta usar o salvo, se não precisar reclassificar
+    # 1) tenta banco
     try:
         cur = await get_lead_status(instance_id, chatid)
     except Exception:
         cur = None
 
-    last_msg_ts = None  # opcional: pode vir no ctx e ser passado para should_reclassify
+    # por padrão, assume que deve reclassificar quando não temos last_msg_ts novo
     need_reclass = True
     if cur and cur.get("stage"):
         try:
             need_reclass = await should_reclassify(
-                instance_id, chatid,
-                last_msg_ts=_last_ts_guard(last_msg_ts),
+                instance_id,
+                chatid,
+                last_msg_ts=None,
                 last_from_me=None,
             )
         except Exception:
-            # se o should_reclassify falhar, assume que NÃO precisa reclassificar
             need_reclass = False
 
         if not need_reclass:
             return {"stage": _normalize_stage(str(cur["stage"]))}
 
-    # classifica (placeholder)
-    stage = await _heuristic_stage(chatid, ctx=ctx, limit=limit)
+    # 2) busca mensagens na UAZAPI e aplica regras
+    base = f"https://{ctx['host']}"
+    headers = {"token": ctx["token"]}
+    payload = {"chatid": chatid, "limit": int(limit or 200), "offset": 0, "sort": "-messageTimestamp"}
+
+    async with httpx.AsyncClient(timeout=20) as cli:
+        r = await cli.post(f"{base}/message/find", json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+
+    items: List[Dict[str, Any]] = []
+    if isinstance(data, dict):
+        if isinstance(data.get("items"), list):
+            items = data["items"]
+        else:
+            for k in ("data", "results", "messages"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    items = v
+                    break
+    elif isinstance(data, list):
+        items = data
+
+    stage, last_ts = _stage_from_messages(items)
     stage = _normalize_stage(stage)
 
     if persist:
@@ -145,7 +242,7 @@ async def classify_chat(
                 instance_id,
                 chatid,
                 stage,
-                last_msg_ts=_last_ts_guard(last_msg_ts),
+                last_msg_ts=int(last_ts or 0),
                 last_from_me=False,
             )
         except Exception:
@@ -153,9 +250,8 @@ async def classify_chat(
 
     return {"stage": stage}
 
-# ------------------------------------------------------------------
-# Compat: alguns módulos antigos importam esse nome
-# ------------------------------------------------------------------
+
+# Compat: alguns módulos importam esse nome
 async def classify_stage(
     chatid: str,
     persist: bool = True,
@@ -164,51 +260,32 @@ async def classify_stage(
 ) -> Dict[str, Any]:
     return await classify_chat(chatid=chatid, persist=persist, limit=limit, ctx=ctx)
 
-# ------------------------------------------------------------------
-# Usado por app/routes/media.py
-# ------------------------------------------------------------------
+
+# Usado por app/routes/media.py (quando já temos as mensagens)
 async def classify_by_rules(
     messages: List[Dict[str, Any]] | None = None,
     chatid: Optional[str] = None,
     ctx: Dict[str, Any] | None = None,
     persist: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Classifica em cima de uma lista de mensagens (regras locais).
-    Se vier `chatid`, tenta persistir/atualizar no banco.
-    """
     msgs = messages or []
-    stage = _heuristic_from_messages(msgs)
+    stage, last_ts = _stage_from_messages(msgs)
     stage = _normalize_stage(stage)
 
-    instance_id = str((ctx or {}).get("instance_id") or "")
-
     if persist and chatid:
+        instance_id = str(
+            (ctx or {}).get("instance_id")
+            or (ctx or {}).get("phone_number_id")
+            or (ctx or {}).get("pnid")
+            or (ctx or {}).get("sub")
+            or ""
+        )
         try:
-            # tenta deduzir last_msg_ts básico
-            last_ts = 0
-            try:
-                if msgs:
-                    # pega o maior timestamp entre as mensagens
-                    for m in msgs:
-                        ts = (
-                            m.get("messageTimestamp")
-                            or m.get("timestamp")
-                            or m.get("t")
-                            or (m.get("message") or {}).get("messageTimestamp")
-                            or 0
-                        )
-                        ts = _last_ts_guard(ts)
-                        if ts > last_ts:
-                            last_ts = ts
-            except Exception:
-                last_ts = 0
-
             await upsert_lead_status(
                 instance_id,
                 chatid,
                 stage,
-                last_msg_ts=last_ts,
+                last_msg_ts=int(last_ts or 0),
                 last_from_me=False,
             )
         except Exception:
