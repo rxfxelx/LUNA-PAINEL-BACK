@@ -34,6 +34,17 @@ def _uaz(ctx: Dict[str, Any]) -> tuple[str, Dict[str, str]]:
     return base, headers
 
 
+def _get_instance_id(ctx: Dict[str, Any]) -> str:
+    # tenta várias claims comuns que vêm no ctx
+    return str(
+        ctx.get("instance_id")
+        or ctx.get("phone_number_id")
+        or ctx.get("pnid")
+        or ctx.get("sub")
+        or ""
+    )
+
+
 def _normalize_items(resp_json: Any) -> Dict[str, List[Dict[str, Any]]]:
     if isinstance(resp_json, dict):
         if isinstance(resp_json.get("items"), list):
@@ -82,18 +93,23 @@ async def _maybe_classify_and_persist(
     last_msg_ts: Optional[int] = None,
 ) -> Optional[str]:
     """
-    Estratégia pedida:
-    - se tiver no banco -> usa e retorna
-    - se não tiver no banco -> classifica e salva
-    - se tiver, mas should_reclassify(instance, chatid, last_msg_ts=...) == True -> reclassifica e salva
+    Estratégia:
+    - Se tiver no banco -> usa e retorna
+    - Se tiver e should_reclassify(...) == False -> não mexe
+    - Se não tiver ou precisar reclassificar -> IA e salva
     """
-    instance_id = str(ctx.get("instance_id") or "")
+    instance_id = _get_instance_id(ctx)
+    if not instance_id:
+        return None
 
     # 1) tenta banco
-    rec = await get_lead_status(instance_id, chatid)
+    try:
+        rec = await get_lead_status(instance_id, chatid)
+    except Exception:
+        rec = None
+
     if rec and rec.get("stage"):
         # decide se precisa reclassificar
-        need = False
         try:
             need = await should_reclassify(
                 instance_id,
@@ -102,13 +118,12 @@ async def _maybe_classify_and_persist(
                 last_from_me=None,
             )
         except Exception:
-            # se der erro, falamos "não precisa reclassificar" para não travar UX
             need = False
 
         if not need:
             return str(rec["stage"])
 
-    # 2) cache curto (evita bombar IA se várias abas)
+    # 2) cache curto (evita bombar IA)
     now = time.time()
     hit = _CLASSIFY_CACHE.get(chatid)
     if hit and (now - hit[0]) <= _CLASSIFY_TTL:
@@ -126,19 +141,20 @@ async def _maybe_classify_and_persist(
             pass
         return stage_cached
 
-    # 3) classifica com IA
+    # 3) classifica com IA (timeout curto)
     try:
         res = await asyncio.wait_for(
             ai_routes.classify_chat(
-                chatid=chatid, persist=False,  # persistiremos nós
-                limit=200, ctx=ctx
+                chatid=chatid,
+                persist=False,  # persistiremos nós
+                limit=200,
+                ctx=ctx,
             ),
-            timeout=3.5,  # timeout curto pra não travar front
+            timeout=3.5,
         )
         stage = (res or {}).get("stage")
         if stage:
             _CLASSIFY_CACHE[chatid] = (now, stage)
-            # salva no banco
             try:
                 await upsert_lead_status(
                     instance_id,
@@ -210,13 +226,10 @@ async def find_chats(
             if not chatid:
                 return
             last_ts = _last_msg_ts_of(item)
-
-            # usa banco se existir; IA só se não houver/precisar
             st = await _maybe_classify_and_persist(ctx, chatid, last_msg_ts=last_ts)
             if st:
                 item["_stage"] = st
                 item["stage"] = st
-                # tenta atualizar CRM interno sem quebrar resposta
                 try:
                     crm_module.set_status_internal(chatid, st)
                 except Exception:
