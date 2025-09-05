@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.routes.deps import get_uazapi_ctx
@@ -23,6 +23,43 @@ from app.services.lead_status import (  # type: ignore
 
 router = APIRouter()
 
+# ---------------- util: extrai instance_id do JWT/headers ---------------- #
+def _b64url_to_bytes(s: str) -> bytes:
+    import base64
+    pad = "=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+def _get_instance_id_from_request(req: Request) -> str:
+    # 1) se um middleware já setou
+    inst = getattr(req.state, "instance_id", None)
+    if inst:
+        return str(inst)
+
+    # 2) header auxiliar
+    h = req.headers.get("x-instance-id")
+    if h:
+        return str(h)
+
+    # 3) decodifica JWT sem verificar assinatura
+    auth = req.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        parts = token.split(".")
+        if len(parts) >= 2:
+            try:
+                import json as _json
+                payload = _json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
+                return str(
+                    payload.get("instance_id")
+                    or payload.get("phone_number_id")
+                    or payload.get("pnid")
+                    or payload.get("sub")
+                    or ""
+                )
+            except Exception:
+                pass
+    return ""
+
 # ---------------- cache simples p/ classificação (protege IA) ---------------- #
 _CLASSIFY_CACHE: dict[str, tuple[float, str]] = {}  # chatid -> (ts_epoch, stage)
 _CLASSIFY_TTL = 300  # 5 minutos
@@ -32,17 +69,6 @@ def _uaz(ctx: Dict[str, Any]) -> tuple[str, Dict[str, str]]:
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
     return base, headers
-
-
-def _get_instance_id(ctx: Dict[str, Any]) -> str:
-    # tenta várias claims comuns que vêm no ctx
-    return str(
-        ctx.get("instance_id")
-        or ctx.get("phone_number_id")
-        or ctx.get("pnid")
-        or ctx.get("sub")
-        or ""
-    )
 
 
 def _normalize_items(resp_json: Any) -> Dict[str, List[Dict[str, Any]]]:
@@ -70,7 +96,6 @@ def _pick_chatid(item: Dict[str, Any]) -> str:
 
 
 def _last_msg_ts_of(item: Dict[str, Any]) -> int:
-    # aceita várias chaves possíveis; retorna em epoch ms se possível
     ts = (
         item.get("wa_lastMsgTimestamp")
         or item.get("messageTimestamp")
@@ -81,13 +106,13 @@ def _last_msg_ts_of(item: Dict[str, Any]) -> int:
         n = int(ts)
     except Exception:
         return 0
-    # alguns backends podem devolver segundos
     if len(str(n)) == 10:
-        n = n * 1000
+        n *= 1000
     return n
 
 
 async def _maybe_classify_and_persist(
+    instance_id: str,
     ctx: Dict[str, Any],
     chatid: str,
     last_msg_ts: Optional[int] = None,
@@ -98,7 +123,6 @@ async def _maybe_classify_and_persist(
     - Se tiver e should_reclassify(...) == False -> não mexe
     - Se não tiver ou precisar reclassificar -> IA e salva
     """
-    instance_id = _get_instance_id(ctx)
     if not instance_id:
         return None
 
@@ -109,7 +133,6 @@ async def _maybe_classify_and_persist(
         rec = None
 
     if rec and rec.get("stage"):
-        # decide se precisa reclassificar
         try:
             need = await should_reclassify(
                 instance_id,
@@ -128,7 +151,6 @@ async def _maybe_classify_and_persist(
     hit = _CLASSIFY_CACHE.get(chatid)
     if hit and (now - hit[0]) <= _CLASSIFY_TTL:
         stage_cached = hit[1]
-        # garante persistência caso não tenha sido salvo
         try:
             await upsert_lead_status(
                 instance_id,
@@ -175,6 +197,7 @@ async def _maybe_classify_and_persist(
 # ------------------ Resposta única (paginada) ------------------ #
 @router.post("/chats")
 async def find_chats(
+    request: Request,
     body: dict | None = Body(None),
     classify: bool = Query(
         True,
@@ -187,6 +210,7 @@ async def find_chats(
     max_total: int = Query(5000, ge=1, le=20000),
     ctx=Depends(get_uazapi_ctx),
 ):
+    instance_id = _get_instance_id_from_request(request)
     base, headers = _uaz(ctx)
     url = f"{base}/chat/find"
 
@@ -226,7 +250,7 @@ async def find_chats(
             if not chatid:
                 return
             last_ts = _last_msg_ts_of(item)
-            st = await _maybe_classify_and_persist(ctx, chatid, last_msg_ts=last_ts)
+            st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
             if st:
                 item["_stage"] = st
                 item["stage"] = st
@@ -243,11 +267,13 @@ async def find_chats(
 # ------------------ Stream NDJSON ------------------ #
 @router.post("/chats/stream")
 async def stream_chats(
+    request: Request,
     body: dict | None = Body(None),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
     ctx=Depends(get_uazapi_ctx),
 ):
+    instance_id = _get_instance_id_from_request(request)
     base, headers = _uaz(ctx)
     url = f"{base}/chat/find"
 
@@ -262,7 +288,7 @@ async def stream_chats(
                 chatid = _pick_chatid(item)
                 if chatid:
                     last_ts = _last_msg_ts_of(item)
-                    st = await _maybe_classify_and_persist(ctx, chatid, last_msg_ts=last_ts)
+                    st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
                     if st:
                         item["_stage"] = st
                         item["stage"] = st
