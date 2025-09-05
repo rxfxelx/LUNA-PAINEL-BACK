@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
@@ -96,6 +96,7 @@ def _pick_chatid(item: Dict[str, Any]) -> str:
 
 
 def _last_msg_ts_of(item: Dict[str, Any]) -> int:
+    """Retorna ts em milissegundos (aceita segundos)."""
     ts = (
         item.get("wa_lastMsgTimestamp")
         or item.get("messageTimestamp")
@@ -106,7 +107,8 @@ def _last_msg_ts_of(item: Dict[str, Any]) -> int:
         n = int(ts)
     except Exception:
         return 0
-    if len(str(n)) == 10:
+    s = str(abs(n))
+    if len(s) == 10:  # epoch s
         n *= 1000
     return n
 
@@ -258,8 +260,17 @@ async def find_chats(
                     crm_module.set_status_internal(chatid, st)
                 except Exception:
                     pass
+            # anexa ts normalizado p/ ordenação
+            item["_last_ts"] = last_ts
 
         await asyncio.gather(*(worker(it) for it in items))
+    else:
+        # mesmo sem classificar, garante o campo de ordenação
+        for it in items:
+            it["_last_ts"] = _last_msg_ts_of(it)
+
+    # >>> ORDEM GLOBAL POR ÚLTIMA INTERAÇÃO (desc) – igual WhatsApp
+    items.sort(key=lambda x: int(x.get("_last_ts") or 0), reverse=True)
 
     return {"items": items}
 
@@ -284,10 +295,10 @@ async def stream_chats(
 
         async with httpx.AsyncClient(timeout=30) as cli:
 
-            async def process_item(item: dict) -> str:
+            async def process_item(item: dict) -> Tuple[int, str]:
                 chatid = _pick_chatid(item)
+                last_ts = _last_msg_ts_of(item)
                 if chatid:
-                    last_ts = _last_msg_ts_of(item)
                     st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
                     if st:
                         item["_stage"] = st
@@ -296,7 +307,8 @@ async def stream_chats(
                             crm_module.set_status_internal(chatid, st)
                         except Exception:
                             pass
-                return json.dumps(item, ensure_ascii=False) + "\n"
+                item["_last_ts"] = last_ts
+                return last_ts, json.dumps(item, ensure_ascii=False) + "\n"
 
             while count < max_total:
                 payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
@@ -317,12 +329,17 @@ async def stream_chats(
                 if not chunk:
                     break
 
+                # processa o chunk inteiro, ordena por ts desc e só então emite
                 coros = [process_item(it) for it in chunk]
+                results = []
                 for fut in asyncio.as_completed(coros):
                     try:
-                        line = await fut
+                        results.append(await fut)
                     except Exception as e:
-                        line = json.dumps({"error": f"process_item: {e}"}) + "\n"
+                        results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
+
+                # ordena no servidor por última interação
+                for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
                     yield line
                     count += 1
                     if count >= max_total:
