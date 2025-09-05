@@ -16,14 +16,14 @@ from app.pg import get_pool
 # ---------- helpers ----------
 
 def _row_to_dict(row: Tuple) -> Dict[str, Any]:
-    # row order must match SELECT order below
+    # row order must match SELECT order abaixo
     if not row:
         return {}
     instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me = row
     return {
         "instance_id": instance_id,
         "chatid": chatid,
-        "stage": stage,
+        "stage": _normalize_stage(stage),
         "updatedAt": updated_at.isoformat() if updated_at else None,
         "last_msg_ts": int(last_msg_ts or 0),
         "last_from_me": bool(last_from_me),
@@ -56,6 +56,13 @@ def _canon_forms(cid: str) -> List[str]:
         return [c]
     return [c, f"{c}@s.whatsapp.net"]
 
+def _base_key(cid: str) -> str:
+    """Chave lógica p/ agrupar 5511... e 5511...@s.whatsapp.net."""
+    c = (cid or "").strip()
+    if c.endswith("@s.whatsapp.net"):
+        return c[:-len("@s.whatsapp.net")]
+    return c
+
 def _guess_store_chatid(con, instance_id: str, chatid: str) -> str:
     """
     Escolhe qual chatid usar para armazenar:
@@ -64,6 +71,8 @@ def _guess_store_chatid(con, instance_id: str, chatid: str) -> str:
     - fallback: usa o recebido
     """
     forms = _canon_forms(chatid)
+    if not forms:
+        return chatid
     placeholders = ", ".join(["%s"] * len(forms))
     with con.cursor() as cur:
         cur.execute(
@@ -112,11 +121,15 @@ def _get_many_lead_status_sync(instance_id: str, chatids: Iterable[str]) -> List
     base_ids = [c for c in dict.fromkeys(chatids) if c]
     if not base_ids:
         return []
+
     # expande cada id para formas canônicas e dedup
     all_ids: List[str] = []
     for c in base_ids:
         all_ids.extend(_canon_forms(c))
     all_ids = list(dict.fromkeys(all_ids))
+    if not all_ids:
+        return []
+
     placeholders = ", ".join(["%s"] * len(all_ids))
     params: Tuple[Any, ...] = (instance_id, *all_ids)
 
@@ -132,7 +145,19 @@ def _get_many_lead_status_sync(instance_id: str, chatids: Iterable[str]) -> List
                 params,
             )
             rows = cur.fetchall() or []
-    return [_row_to_dict(r) for r in rows]
+
+    # Pode vir duplicado (ex.: 5511... e 5511...@s.whatsapp.net). Mantém o mais recente por base_key.
+    best_by_base: Dict[str, Tuple] = {}
+    for r in rows:
+        # r = (instance_id, chatid, stage, updated_at, last_msg_ts, last_from_me)
+        chatid = r[1]
+        updated_at = r[3]
+        base = _base_key(chatid)
+        cur = best_by_base.get(base)
+        if (cur is None) or (updated_at and cur[3] and updated_at > cur[3]):
+            best_by_base[base] = r
+
+    return [_row_to_dict(r) for r in best_by_base.values()]
 
 def _upsert_lead_status_sync(
     instance_id: str,
