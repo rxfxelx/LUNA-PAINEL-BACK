@@ -24,6 +24,7 @@ def _env_list(name: str) -> list[str]:
         return []
     return [x.strip() for x in raw.split(",") if x.strip()]
 
+
 def _is_admin_bypass(user: Dict[str, Any]) -> bool:
     """
     Bypass para contas administradoras. Ativa caso QUALQUER uma das listas case:
@@ -32,11 +33,11 @@ def _is_admin_bypass(user: Dict[str, Any]) -> bool:
       - ADMIN_BYPASS_TOKENS  (com base em user['token'] ou user['instance_token'])
     """
     emails = set(x.lower() for x in _env_list("ADMIN_BYPASS_EMAILS"))
-    hosts  = set(_env_list("ADMIN_BYPASS_HOSTS"))
-    toks   = set(_env_list("ADMIN_BYPASS_TOKENS"))
+    hosts = set(_env_list("ADMIN_BYPASS_HOSTS"))
+    toks = set(_env_list("ADMIN_BYPASS_TOKENS"))
 
     email = (user.get("email") or user.get("user_email") or "").lower().strip()
-    host  = (user.get("host") or "").strip()
+    host = (user.get("host") or "").strip()
     token = (user.get("token") or user.get("instance_token") or "").strip()
 
     if email and email in emails:
@@ -47,19 +48,21 @@ def _is_admin_bypass(user: Dict[str, Any]) -> bool:
         return True
     return False
 
+
 def _billing_key_from_user(user: Dict[str, Any]) -> str:
     """
     Monta o billing_key a partir do JWT. Valida token/host.
     """
     token = (user.get("token") or user.get("instance_token") or "").strip()
     host = (user.get("host") or "").strip()
-    iid  = user.get("instance_id")
+    iid = user.get("instance_id")
     if not token or not host:
         raise HTTPException(status_code=401, detail="JWT inválido: sem token/host")
     try:
         return make_billing_key(token, host, iid)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
+
 
 def _safe_get_status(bkey: str) -> Dict[str, Any]:
     """
@@ -74,6 +77,7 @@ def _safe_get_status(bkey: str) -> Dict[str, Any]:
 # ------------------------ modelos ------------------------
 class CheckoutLinkIn(BaseModel):
     return_url: Optional[str] = None  # URL para redirecionar após pagamento (opcional)
+
 
 class WebhookIn(BaseModel):
     ref: str                         # billing_key enviado como reference/order_id
@@ -108,6 +112,7 @@ async def register_trial(user=Depends(get_current_user)) -> Dict[str, Any]:
         try:
             ensure_trial(bkey)
         except Exception:
+            # mantém idempotência mesmo se o serviço falhar; status é lido abaixo
             pass
 
     st = _safe_get_status(bkey)
