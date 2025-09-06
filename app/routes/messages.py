@@ -1,4 +1,3 @@
-# app/routes/messages.py
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 import inspect
@@ -15,6 +14,12 @@ from app.services.lead_status import (  # type: ignore
     upsert_lead_status,
     should_reclassify,
 )
+
+# >>> NOVO: persistência de mensagens (não bloqueante)
+try:
+    from app.services.messages import bulk_upsert_messages  # type: ignore
+except Exception:
+    bulk_upsert_messages = None  # se faltar o módulo, só segue
 
 # --- tenta usar a regra oficial do módulo ai.py; se não existir, usa fallback local
 try:
@@ -167,6 +172,10 @@ async def find_messages(
     Além de devolver normalizado, calcula `stage` e PERSISTE em lead_status quando:
       - não há registro no banco, ou
       - há mensagem mais recente / mudança de autoria (precisa reclassificar).
+
+    >>> NOVO:
+      - Persiste as mensagens em `public.messages` (bulk upsert) quando possível.
+        Essa persistência é best-effort e NÃO bloqueia a resposta.
     """
     if not body or not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Body inválido")
@@ -233,5 +242,14 @@ async def find_messages(
                 )
             except Exception:
                 pass
+
+    # >>> NOVO: persistência best-effort das mensagens (não bloqueia)
+    if bulk_upsert_messages and instance_id and items:
+        try:
+            # não espera — mas se quiser esperar, basta "await"
+            _ = await bulk_upsert_messages(instance_id, chatid, items)
+        except Exception:
+            # nunca propaga erro de persistência de mensagens
+            pass
 
     return {"items": items, "stage": stage}
