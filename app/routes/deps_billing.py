@@ -1,4 +1,3 @@
-# app/routes/deps_billing.py
 from __future__ import annotations
 
 import os
@@ -9,6 +8,29 @@ from app.auth import get_current_user
 from app.services.billing import make_billing_key, get_status, ensure_trial
 
 
+# ---------------------- helpers bypass ----------------------
+def _env_list(name: str) -> list[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+def _is_admin_bypass(user: Dict[str, Any]) -> bool:
+    emails = set(x.lower() for x in _env_list("ADMIN_BYPASS_EMAILS"))
+    hosts  = set(_env_list("ADMIN_BYPASS_HOSTS"))
+    toks   = set(_env_list("ADMIN_BYPASS_TOKENS"))
+
+    email = (user.get("email") or user.get("user_email") or "").lower().strip()
+    host  = (user.get("host") or "").strip()
+    token = (user.get("token") or user.get("instance_token") or "").strip()
+
+    return (
+        (email and email in emails) or
+        (host and host in hosts) or
+        (token and token in toks)
+    )
+
+
 async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any]:
     """
     Gate de billing para rotas operacionais.
@@ -17,11 +39,20 @@ async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any
     - Se não existir registro, tenta iniciar trial e reconsulta.
     - Retorna 402 (Payment Required) quando a assinatura não está ativa.
     - Se DISABLE_BILLING=1, libera o acesso (útil para hotfix/diagnóstico).
+    - Se for admin (bypass), libera SEM consultar billing.
 
     Retorno (quando ativo):
-      { "billing_key": <str>, "status": <dict>, "user": <dict> }
+      { "billing_key": <str | None>, "status": <dict>, "user": <dict> }
     """
-    # Bypass opcional (p/ emergência/diagnóstico)
+    # Admin bypass primeiro (não depende de billing)
+    if _is_admin_bypass(user):
+        return {
+            "billing_key": None,
+            "status": {"active": True, "plan": "admin", "admin_bypass": True},
+            "user": user,
+        }
+
+    # Bypass global opcional (emergência)
     if os.getenv("DISABLE_BILLING", "0") == "1":
         return {
             "billing_key": "disabled",
@@ -40,7 +71,6 @@ async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any
     try:
         bkey = make_billing_key(token, host, iid)
     except Exception as e:
-        # Qualquer erro aqui não deve virar 500 para o cliente
         raise HTTPException(
             status_code=402,
             detail={"message": f"Erro ao gerar billing_key: {e}", "require_payment": True},
@@ -60,7 +90,6 @@ async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any
         try:
             ensure_trial(bkey)
         except Exception:
-            # segue mesmo se falhar; reconsulta abaixo para devolver estado atual
             pass
         try:
             st = get_status(bkey)
@@ -73,7 +102,7 @@ async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any
     if st.get("active"):
         return {"billing_key": bkey, "status": st, "user": user}
 
-    # 402 Payment Required comunica claramente ao front que precisa pagar
+    # 402 Payment Required
     raise HTTPException(
         status_code=402,
         detail={
@@ -90,23 +119,17 @@ async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any
     )
 
 
-# -----------------------------------------------------------------------------
-# Wrapper "soft" opcional:
-# - Mantém 401/402/403 como estão;
-# - Qualquer outra falha inesperada NÃO derruba a rota (retorna None).
-#   Útil para endpoints que podem funcionar mesmo se o billing oscilar.
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Versão 'soft': não derruba por falhas inesperadas (exceto 401/402/403)
+# -------------------------------------------------------------------
 async def require_active_tenant_soft(
     user=Depends(get_current_user),
 ) -> Optional[Dict[str, Any]]:
     try:
-        return await require_active_tenant(user)  # reaproveita o guard estrito
+        return await require_active_tenant(user)
     except HTTPException as e:
         if e.status_code in (401, 402, 403):
-            # Erros esperados continuam bloqueando a rota
             raise
-        # Falha inesperada de infra/billing: não converter em 500
         return None
     except Exception:
-        # Failsafe final
         return None
