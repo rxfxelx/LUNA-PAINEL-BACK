@@ -24,7 +24,7 @@ def get_pool() -> ConnectionPool:
             conninfo=dsn,
             max_size=size,
             configure=_configure,
-            kwargs={"row_factory": dict_row},  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            kwargs={"row_factory": dict_row},
         )
     return _pool
 
@@ -39,6 +39,7 @@ def init_schema():
     - Tabela lead_status -> garante migrações/índices
     - Tabela billing_accounts -> trial + cobrança
     - Tabela users -> login por e-mail/senha
+    - Tabela messages -> armazenamento local de mensagens
     """
     sql = """
     -- =========================================
@@ -130,6 +131,28 @@ def init_schema():
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_login_at   TIMESTAMPTZ NULL
     );
+
+    -- =========================================
+    -- MESSAGES (armazenamento local)
+    -- =========================================
+    CREATE TABLE IF NOT EXISTS messages (
+      instance_id   TEXT        NOT NULL,
+      chatid        TEXT        NOT NULL,
+      msgid         TEXT        NOT NULL,
+      from_me       BOOLEAN     NOT NULL DEFAULT FALSE,
+      ts            BIGINT      NOT NULL,
+      text          TEXT,
+      media_url     TEXT,
+      media_mime    TEXT,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (instance_id, chatid, msgid)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_chat_ts
+      ON messages(instance_id, chatid, ts DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_messages_ts
+      ON messages(ts DESC);
     """
     with get_pool().connection() as con:
         con.execute(sql)
