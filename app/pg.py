@@ -27,8 +27,9 @@ def get_conn():
 
 def init_schema():
     """
-    - Tabela lead_status (já existente) -> garante migrações/índices
-    - **Nova** tabela billing_accounts (trial + cobrança)
+    - Tabela lead_status -> garante migrações/índices
+    - Tabela billing_accounts -> trial + cobrança
+    - Tabela users -> login por e-mail/senha
     """
     sql = """
     -- =========================================
@@ -109,6 +110,17 @@ def init_schema():
 
     CREATE INDEX IF NOT EXISTS idx_billing_paid_until ON billing_accounts(paid_until DESC);
     CREATE INDEX IF NOT EXISTS idx_billing_trial_ends ON billing_accounts(trial_ends_at DESC);
+
+    -- =========================================
+    -- USERS (login por e-mail/senha)
+    -- =========================================
+    CREATE TABLE IF NOT EXISTS users (
+      id              SERIAL PRIMARY KEY,
+      email           TEXT NOT NULL UNIQUE,
+      password_hash   TEXT NOT NULL,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_login_at   TIMESTAMPTZ NULL
+    );
     """
     with get_pool().connection() as con:
         con.execute(sql)
