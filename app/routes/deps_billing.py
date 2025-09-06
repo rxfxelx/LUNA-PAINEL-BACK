@@ -1,7 +1,6 @@
-# app/routes/deps_billing.py
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from app.auth import get_current_user
 from app.services.billing import make_billing_key, get_status, ensure_trial
 
@@ -44,3 +43,22 @@ async def require_active_tenant(user=Depends(get_current_user)) -> dict:
             "plan": st.get("plan"),
         },
     )
+
+
+# -----------------------------------------------------------------------------
+# Wrapper "soft" opcional: não derruba com 500 se houver erro inesperado
+# (ex.: intermitência de rede/DB). Mantém 401/402/403 como estão.
+# -----------------------------------------------------------------------------
+async def require_active_tenant_soft(request: Request):
+    try:
+        # Reaproveita o guard estrito
+        return await require_active_tenant()  # type: ignore
+    except HTTPException as e:
+        if e.status_code in (401, 402, 403):
+            # Erros esperados continuam subindo
+            raise
+        # Qualquer outra falha não bloqueia a rota
+        return None
+    except Exception:
+        # Failsafe: não converter em 500
+        return None
