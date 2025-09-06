@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 import bcrypt
 from app.pg import get_pool
 
-def _utcnow(): return datetime.now(timezone.utc)
+def _utcnow(): 
+    return datetime.now(timezone.utc)
 
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
@@ -29,13 +30,13 @@ def create_user(email: str, password: str) -> Dict[str, Any]:
         row = con.execute(sql, (email, pwd_hash)).fetchone()
     if not row:
         raise ValueError("E-mail já cadastrado")
-    return dict(row)
+    return dict(row._mapping)   # ✅ corrigido
 
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     sql = "SELECT id, email, password_hash, created_at, last_login_at FROM users WHERE email=%s"
     with get_pool().connection() as con:
         row = con.execute(sql, (email.strip().lower(),)).fetchone()
-    return dict(row) if row else None
+    return dict(row._mapping) if row else None   # ✅ corrigido
 
 def touch_last_login(user_id: int) -> None:
     with get_pool().connection() as con:
