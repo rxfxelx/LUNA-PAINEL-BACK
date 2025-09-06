@@ -6,7 +6,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 
 from app.routes.deps import get_uazapi_ctx
-from app.routes.deps_billing import require_active_tenant  # <-- NOVO
+# USAR guard tolerante aqui também
+from app.routes.deps_billing import require_active_tenant_soft
 
 # lead_status (persistência)
 from app.services.lead_status import (  # type: ignore
@@ -164,7 +165,7 @@ def _is_from_me(m: Dict[str, Any]) -> bool:
 async def find_messages(
     request: Request,
     body: dict | None = Body(None),
-    _user=Depends(require_active_tenant),  # <-- BLOQUEIA se assinatura inativa
+    _user=Depends(require_active_tenant_soft),  # <<< guard tolerante
     ctx=Depends(get_uazapi_ctx),
 ):
     """
@@ -246,10 +247,8 @@ async def find_messages(
     # >>> NOVO: persistência best-effort das mensagens (não bloqueia)
     if bulk_upsert_messages and instance_id and items:
         try:
-            # não espera — mas se quiser esperar, basta "await"
             _ = await bulk_upsert_messages(instance_id, chatid, items)
         except Exception:
-            # nunca propaga erro de persistência de mensagens
             pass
 
     return {"items": items, "stage": stage}
