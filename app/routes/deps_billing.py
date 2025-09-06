@@ -34,15 +34,6 @@ def _is_admin_bypass(user: Dict[str, Any]) -> bool:
 async def require_active_tenant(user=Depends(get_current_user)) -> Dict[str, Any]:
     """
     Gate de billing para rotas operacionais.
-
-    - Identifica o tenant pelo JWT (token/host/instance_id) e monta o billing_key.
-    - Se não existir registro, tenta iniciar trial e reconsulta.
-    - Retorna 402 (Payment Required) quando a assinatura não está ativa.
-    - Se DISABLE_BILLING=1, libera o acesso (útil para hotfix/diagnóstico).
-    - Se for admin (bypass), libera SEM consultar billing.
-
-    Retorno (quando ativo):
-      { "billing_key": <str | None>, "status": <dict>, "user": <dict> }
     """
     # Admin bypass primeiro (não depende de billing)
     if _is_admin_bypass(user):
