@@ -1,29 +1,38 @@
-# app/pg.py
 import os
 from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row  # <- cada fetch* já vem como dict
 
-_pool = None
+_pool: ConnectionPool | None = None
+
 
 def get_pool() -> ConnectionPool:
     """
-    Singleton do pool de conexões (autocommit ligado).
+    Singleton do pool de conexões (autocommit ligado, row_factory=dict_row).
     """
     global _pool
     if _pool is None:
         dsn = os.getenv("DATABASE_URL")
         if not dsn:
             raise RuntimeError("DATABASE_URL não definido no ambiente em runtime")
+
         size = int(os.getenv("PGPOOL_SIZE", "5"))
 
         def _configure(conn):
             conn.autocommit = True
 
-        _pool = ConnectionPool(conninfo=dsn, max_size=size, configure=_configure)
+        _pool = ConnectionPool(
+            conninfo=dsn,
+            max_size=size,
+            configure=_configure,
+            kwargs={"row_factory": dict_row},  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        )
     return _pool
+
 
 # helper opcional (uso: with get_conn() as con: con.execute(...))
 def get_conn():
     return get_pool().connection()
+
 
 def init_schema():
     """
@@ -97,7 +106,7 @@ def init_schema():
     -- =========================================
     CREATE TABLE IF NOT EXISTS billing_accounts (
       id                  SERIAL PRIMARY KEY,
-      billing_key         TEXT UNIQUE NOT NULL,   -- iid:<uuid> OU hash(host|token)
+      billing_key         TEXT UNIQUE NOT NULL,
       instance_id         TEXT,
       host                TEXT,
       created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
