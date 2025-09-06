@@ -7,11 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.routes.deps import get_uazapi_ctx
-from app.routes.deps_billing import require_active_tenant  # <-- NOVO
-from app.services.lead_status import upsertLeadStatus
+from app.routes.deps_billing import require_active_tenant   # ✅ verifica trial/pagamento
+from app.services.lead_status import upsert_lead_status     # ✅ snake_case + await
 
 router = APIRouter()
-
 
 class SendText(BaseModel):
     number: str
@@ -34,7 +33,6 @@ class SendList(BaseModel):
     button_text: str
     sections: list[dict]
 
-
 def base(host: str) -> str:
     return f"https://{host}"
 
@@ -44,11 +42,10 @@ def hdr(tok: str) -> dict:
 def to_dict(m: BaseModel) -> dict:
     return m.model_dump() if hasattr(m, "model_dump") else m.dict()
 
-
 @router.post("/send-text")
 async def send_text(
     body: SendText,
-    _user=Depends(require_active_tenant),  # <-- BLOQUEIA se assinatura inativa
+    user=Depends(require_active_tenant),   # ✅ bloqueia se expirado
     ctx=Depends(get_uazapi_ctx),
 ):
     host, tok = ctx["host"], ctx["token"]
@@ -59,16 +56,16 @@ async def send_text(
             raise HTTPException(r.status_code, r.text)
         resp = r.json()
         try:
-            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+            inst = user.get("instance_id") or ""
+            await upsert_lead_status(inst, body.number, None, int(time.time() * 1000), True)  # ✅ ms
         except Exception:
             pass
         return resp
 
-
 @router.post("/send-media")
 async def send_media(
     body: SendMedia,
-    _user=Depends(require_active_tenant),
+    user=Depends(require_active_tenant),
     ctx=Depends(get_uazapi_ctx),
 ):
     host, tok = ctx["host"], ctx["token"]
@@ -79,16 +76,16 @@ async def send_media(
             raise HTTPException(r.status_code, r.text)
         resp = r.json()
         try:
-            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+            inst = user.get("instance_id") or ""
+            await upsert_lead_status(inst, body.number, None, int(time.time() * 1000), True)
         except Exception:
             pass
         return resp
 
-
 @router.post("/send-buttons")
 async def send_buttons(
     body: SendButtons,
-    _user=Depends(require_active_tenant),
+    user=Depends(require_active_tenant),
     ctx=Depends(get_uazapi_ctx),
 ):
     host, tok = ctx["host"], ctx["token"]
@@ -99,16 +96,16 @@ async def send_buttons(
             raise HTTPException(r.status_code, r.text)
         resp = r.json()
         try:
-            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+            inst = user.get("instance_id") or ""
+            await upsert_lead_status(inst, body.number, None, int(time.time() * 1000), True)
         except Exception:
             pass
         return resp
 
-
 @router.post("/send-list")
 async def send_list(
     body: SendList,
-    _user=Depends(require_active_tenant),
+    user=Depends(require_active_tenant),
     ctx=Depends(get_uazapi_ctx),
 ):
     host, tok = ctx["host"], ctx["token"]
@@ -119,7 +116,8 @@ async def send_list(
             raise HTTPException(r.status_code, r.text)
         resp = r.json()
         try:
-            upsertLeadStatus(body.number, stage=None, last_msg_ts=int(time.time()), last_from_me=True)
+            inst = user.get("instance_id") or ""
+            await upsert_lead_status(inst, body.number, None, int(time.time() * 1000), True)
         except Exception:
             pass
         return resp
