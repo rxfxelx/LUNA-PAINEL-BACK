@@ -12,7 +12,8 @@ from fastapi.responses import StreamingResponse
 from app.routes.deps import get_uazapi_ctx
 from app.routes import ai as ai_routes
 from app.routes import crm as crm_module
-from app.routes.deps_billing import require_active_tenant  # bloqueia se assinatura inativa
+# trocado: usa o wrapper que não derruba a rota com 500 inesperado
+from app.routes.deps_billing import require_active_tenant_soft  # bloqueia se inativa (modo tolerante)
 
 # DB helpers de lead status
 from app.services.lead_status import (  # type: ignore
@@ -202,7 +203,7 @@ async def find_chats(
     ),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
-    _user=Depends(require_active_tenant),
+    _user=Depends(require_active_tenant_soft),   # <<< guard tolerante
     ctx=Depends(get_uazapi_ctx),
 ):
     instance_id = _get_instance_id_from_request(request)
@@ -269,7 +270,7 @@ async def stream_chats(
     body: dict | None = Body(None),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
-    _user=Depends(require_active_tenant),
+    _user=Depends(require_active_tenant_soft),   # <<< guard tolerante
     ctx=Depends(get_uazapi_ctx),
 ):
     instance_id = _get_instance_id_from_request(request)
@@ -277,62 +278,66 @@ async def stream_chats(
     url = f"{base}/chat/find"
 
     async def gen():
-        count = 0
-        offset = 0
+        try:
+            count = 0
+            offset = 0
 
-        async with httpx.AsyncClient(timeout=30) as cli:
+            async with httpx.AsyncClient(timeout=30) as cli:
 
-            async def process_item(item: dict) -> Tuple[int, str]:
-                chatid = _pick_chatid(item)
-                last_ts = _last_msg_ts_of(item)
-                if chatid:
-                    st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
-                    if st:
-                        item["_stage"] = st
-                        item["stage"] = st
-                        try:
-                            crm_module.set_status_internal(chatid, st)
-                        except Exception:
-                            pass
-                item["_last_ts"] = last_ts
-                return last_ts, json.dumps(item, ensure_ascii=False) + "\n"
+                async def process_item(item: dict) -> Tuple[int, str]:
+                    chatid = _pick_chatid(item)
+                    last_ts = _last_msg_ts_of(item)
+                    if chatid:
+                        st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
+                        if st:
+                            item["_stage"] = st
+                            item["stage"] = st
+                            try:
+                                crm_module.set_status_internal(chatid, st)
+                            except Exception:
+                                pass
+                    item["_last_ts"] = last_ts
+                    return last_ts, json.dumps(item, ensure_ascii=False) + "\n"
 
-            while count < max_total:
-                payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
-                payload = {**payload, "limit": page_size, "offset": offset}
+                while count < max_total:
+                    payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+                    payload = {**payload, "limit": page_size, "offset": offset}
 
-                r = await cli.post(url, json=payload, headers=headers)
-                if r.status_code >= 400:
-                    yield json.dumps({"error": r.text}) + "\n"
-                    return
+                    r = await cli.post(url, json=payload, headers=headers)
+                    if r.status_code >= 400:
+                        yield json.dumps({"error": r.text}) + "\n"
+                        return
 
-                try:
-                    data = r.json()
-                except Exception:
-                    yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\n"
-                    return
-
-                chunk = _normalize_items(data)["items"]
-                if not chunk:
-                    break
-
-                # processa em paralelo e mantém ordem por last_ts desc
-                coros = [process_item(it) for it in chunk]
-                results: list[Tuple[int, str]] = []
-                for fut in asyncio.as_completed(coros):
                     try:
-                        results.append(await fut)
-                    except Exception as e:
-                        results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
+                        data = r.json()
+                    except Exception:
+                        yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\n"
+                        return
 
-                for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
-                    yield line
-                    count += 1
-                    if count >= max_total:
+                    chunk = _normalize_items(data)["items"]
+                    if not chunk:
                         break
 
-                if len(chunk) < page_size or count >= max_total:
-                    break
-                offset += page_size
+                    # processa em paralelo e mantém ordem por last_ts desc
+                    coros = [process_item(it) for it in chunk]
+                    results: list[Tuple[int, str]] = []
+                    for fut in asyncio.as_completed(coros):
+                        try:
+                            results.append(await fut)
+                        except Exception as e:
+                            results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
+
+                    for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
+                        yield line
+                        count += 1
+                        if count >= max_total:
+                            break
+
+                    if len(chunk) < page_size or count >= max_total:
+                        break
+                    offset += page_size
+        except Exception as e:
+            # failsafe: nunca transforma em 500; retorna NDJSON de erro
+            yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
