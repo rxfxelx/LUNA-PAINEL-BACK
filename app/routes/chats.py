@@ -1,4 +1,3 @@
-# app/routes/chats.py
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from app.routes.deps import get_uazapi_ctx
 from app.routes import ai as ai_routes
 from app.routes import crm as crm_module
-from app.routes.deps_billing import require_active_tenant  # <-- NOVO
+from app.routes.deps_billing import require_active_tenant  # bloqueia se assinatura inativa
 
 # DB helpers de lead status
 from app.services.lead_status import (  # type: ignore
@@ -48,13 +47,11 @@ def _get_instance_id_from_request(req: Request) -> str:
         parts = token.split(".")
         if len(parts) >= 2:
             try:
-                import json as _json
-                payload = _json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
+                payload = json.loads(_b64url_to_bytes(parts[1]).decode("utf-8"))
                 return str(
                     payload.get("instance_id")
                     or payload.get("phone_number_id")
                     or payload.get("pnid")
-                    or payload.get("sub")
                     or ""
                 )
             except Exception:
@@ -65,12 +62,10 @@ def _get_instance_id_from_request(req: Request) -> str:
 _CLASSIFY_CACHE: dict[str, tuple[float, str]] = {}  # chatid -> (ts_epoch, stage)
 _CLASSIFY_TTL = 300  # 5 minutos
 
-
 def _uaz(ctx: Dict[str, Any]) -> tuple[str, Dict[str, str]]:
     base = f"https://{ctx['host']}"
     headers = {"token": ctx["token"]}
     return base, headers
-
 
 def _normalize_items(resp_json: Any) -> Dict[str, List[Dict[str, Any]]]:
     if isinstance(resp_json, dict):
@@ -85,7 +80,6 @@ def _normalize_items(resp_json: Any) -> Dict[str, List[Dict[str, Any]]]:
         return {"items": resp_json}
     return {"items": []}
 
-
 def _pick_chatid(item: Dict[str, Any]) -> str:
     return (
         item.get("wa_chatid")
@@ -94,7 +88,6 @@ def _pick_chatid(item: Dict[str, Any]) -> str:
         or item.get("id")
         or ""
     )
-
 
 def _last_msg_ts_of(item: Dict[str, Any]) -> int:
     """Retorna ts em milissegundos (aceita segundos)."""
@@ -113,7 +106,6 @@ def _last_msg_ts_of(item: Dict[str, Any]) -> int:
         n *= 1000
     return n
 
-
 async def _maybe_classify_and_persist(
     instance_id: str,
     ctx: Dict[str, Any],
@@ -129,7 +121,7 @@ async def _maybe_classify_and_persist(
     if not instance_id:
         return None
 
-    # 1) tenta banco
+    # 1) banco
     try:
         rec = await get_lead_status(instance_id, chatid)
     except Exception:
@@ -149,7 +141,7 @@ async def _maybe_classify_and_persist(
         if not need:
             return str(rec["stage"])
 
-    # 2) cache curto (evita bombar IA)
+    # 2) cache curto
     now = time.time()
     hit = _CLASSIFY_CACHE.get(chatid)
     if hit and (now - hit[0]) <= _CLASSIFY_TTL:
@@ -166,12 +158,12 @@ async def _maybe_classify_and_persist(
             pass
         return stage_cached
 
-    # 3) classifica com IA (timeout curto)
+    # 3) IA
     try:
         res = await asyncio.wait_for(
             ai_routes.classify_chat(
                 chatid=chatid,
-                persist=False,  # persistiremos nós
+                persist=False,
                 limit=200,
                 ctx=ctx,
             ),
@@ -196,7 +188,6 @@ async def _maybe_classify_and_persist(
 
     return None
 
-
 # ------------------ Resposta única (paginada) ------------------ #
 @router.post("/chats")
 async def find_chats(
@@ -211,7 +202,7 @@ async def find_chats(
     ),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
-    _user=Depends(require_active_tenant),   # <-- BLOQUEIA se assinatura inativa
+    _user=Depends(require_active_tenant),
     ctx=Depends(get_uazapi_ctx),
 ):
     instance_id = _get_instance_id_from_request(request)
@@ -247,8 +238,6 @@ async def find_chats(
     items = items[:max_total]
 
     if classify and items:
-        sem = asyncio.Semaphore(16)
-
         async def worker(item: dict):
             chatid = _pick_chatid(item)
             if not chatid:
@@ -273,7 +262,6 @@ async def find_chats(
 
     return {"items": items}
 
-
 # ------------------ Stream NDJSON ------------------ #
 @router.post("/chats/stream")
 async def stream_chats(
@@ -281,7 +269,7 @@ async def stream_chats(
     body: dict | None = Body(None),
     page_size: int = Query(100, ge=1, le=500),
     max_total: int = Query(5000, ge=1, le=20000),
-    _user=Depends(require_active_tenant),   # <-- BLOQUEIA se assinatura inativa
+    _user=Depends(require_active_tenant),
     ctx=Depends(get_uazapi_ctx),
 ):
     instance_id = _get_instance_id_from_request(request)
@@ -291,7 +279,6 @@ async def stream_chats(
     async def gen():
         count = 0
         offset = 0
-        sem = asyncio.Semaphore(16)
 
         async with httpx.AsyncClient(timeout=30) as cli:
 
@@ -329,8 +316,9 @@ async def stream_chats(
                 if not chunk:
                     break
 
+                # processa em paralelo e mantém ordem por last_ts desc
                 coros = [process_item(it) for it in chunk]
-                results = []
+                results: list[Tuple[int, str]] = []
                 for fut in asyncio.as_completed(coros):
                     try:
                         results.append(await fut)
