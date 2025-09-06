@@ -1,4 +1,5 @@
-# app/auth.py
+from __future__ import annotations
+
 import os
 import re
 from datetime import datetime, timedelta
@@ -21,6 +22,12 @@ def _get_env_str(*keys: str, default: str = "") -> str:
     return default
 
 def _get_exp_minutes() -> int:
+    """
+    Prioridades:
+      1) JWT_EXPIRE_MINUTES (minutos)
+      2) LUNA_JWT_TTL (segundos)
+      3) fallback: 30 dias
+    """
     vmin = os.getenv("JWT_EXPIRE_MINUTES")
     if vmin and vmin.isdigit():
         return int(vmin)
@@ -39,7 +46,7 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 
 # --------- MODELOS ---------
 class LoginIn(BaseModel):
-    token: str                         # token/sessão da instância na UAZAPI (ou às vezes te passam o UUID)
+    token: str                         # token/sessão da instância na UAZAPI (ou UUID)
     host: Optional[str] = None         # se não vier, usa UAZAPI_HOST
     label: Optional[str] = None
     number_hint: Optional[str] = None
@@ -76,7 +83,7 @@ def login(body: LoginIn) -> LoginOut:
     Gera um JWT contendo:
       - token: token/sessão da UAZAPI (obrigatório)
       - host: host/base da UAZAPI (obrigatório; vem do body ou de UAZAPI_HOST)
-      - instance_id (quando o 'token' tiver cara de UUID, gravamos também)
+      - instance_id (quando o 'token' tiver cara de UUID)
       - claims auxiliares (label/number_hint) para a UI
     """
     raw_token = (body.token or "").strip()
@@ -87,13 +94,13 @@ def login(body: LoginIn) -> LoginOut:
     if not host:
         raise HTTPException(
             status_code=400,
-            detail="Host da UAZAPI ausente. Defina a env UAZAPI_HOST ou envie 'host' no login."
+            detail="Host da UAZAPI ausente. Defina a env UAZAPI_HOST ou envie 'host' no login.",
         )
 
-    # normaliza host (sem protocolo no começo)
+    # normaliza host (sem protocolo / barras finais)
     host = host.replace("https://", "").replace("http://", "").strip("/")
 
-    # Se parecer um UUID, guardamos também como instance_id (ajuda nas rotas que persistem no banco)
+    # Se parecer um UUID, guardamos como instance_id
     instance_id: Optional[str] = raw_token if UUID_RE.match(raw_token) else None
 
     now = datetime.utcnow()
@@ -104,18 +111,17 @@ def login(body: LoginIn) -> LoginOut:
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
         # usados pelas rotas/deps:
-        "token": raw_token,          # header "token" para a UAZAPI
-        "host": host,                # base da UAZAPI (ex: api.uazapi.com)
+        "token": raw_token,
+        "host": host,
         # compat/extra:
         "instance_token": raw_token,
-        "instance_id": instance_id,  # pode ser None; tudo bem
+        "instance_id": instance_id,
         "label": (body.label or None),
         "number_hint": (body.number_hint or None),
     }
 
     tok = _jwt_encode(payload)
 
-    # resposta enxuta (profile é só para exibição no front)
     return LoginOut(
         jwt=tok,
         profile={
@@ -140,7 +146,6 @@ def check(user=Depends(get_current_user)):
 
 @router.get("/me")
 def me(user=Depends(get_current_user)):
-    # útil para debug rápido no front
     return user
 
 @router.get("/debug")
