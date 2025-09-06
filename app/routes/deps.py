@@ -1,4 +1,3 @@
-# app/routes/deps.py
 import os
 from fastapi import Depends, HTTPException
 from app.auth import get_current_user
