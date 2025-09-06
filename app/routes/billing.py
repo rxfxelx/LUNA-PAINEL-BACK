@@ -1,4 +1,3 @@
-# app/routes/billing.py
 from __future__ import annotations
 
 import os
@@ -19,6 +18,35 @@ router = APIRouter()
 
 
 # ------------------------ helpers ------------------------
+def _env_list(name: str) -> list[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+def _is_admin_bypass(user: Dict[str, Any]) -> bool:
+    """
+    Bypass para contas administradoras. Ativa caso QUALQUER uma das listas case:
+      - ADMIN_BYPASS_EMAILS  (com base em user['email'] ou user['user_email'])
+      - ADMIN_BYPASS_HOSTS   (com base em user['host'])
+      - ADMIN_BYPASS_TOKENS  (com base em user['token'] ou user['instance_token'])
+    """
+    emails = set(x.lower() for x in _env_list("ADMIN_BYPASS_EMAILS"))
+    hosts  = set(_env_list("ADMIN_BYPASS_HOSTS"))
+    toks   = set(_env_list("ADMIN_BYPASS_TOKENS"))
+
+    email = (user.get("email") or user.get("user_email") or "").lower().strip()
+    host  = (user.get("host") or "").strip()
+    token = (user.get("token") or user.get("instance_token") or "").strip()
+
+    if email and email in emails:
+        return True
+    if host and host in hosts:
+        return True
+    if token and token in toks:
+        return True
+    return False
+
 def _billing_key_from_user(user: Dict[str, Any]) -> str:
     """
     Monta o billing_key a partir do JWT. Valida token/host.
@@ -33,7 +61,6 @@ def _billing_key_from_user(user: Dict[str, Any]) -> str:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
 
-
 def _safe_get_status(bkey: str) -> Dict[str, Any]:
     """
     Lê o status do billing sem deixar a rota explodir em 500.
@@ -41,14 +68,12 @@ def _safe_get_status(bkey: str) -> Dict[str, Any]:
     try:
         return get_status(bkey)
     except Exception as e:
-        # serviço de billing indisponível, devolve 503 para o front lidar
         raise HTTPException(status_code=503, detail=f"Billing indisponível: {e}")
 
 
 # ------------------------ modelos ------------------------
 class CheckoutLinkIn(BaseModel):
     return_url: Optional[str] = None  # URL para redirecionar após pagamento (opcional)
-
 
 class WebhookIn(BaseModel):
     ref: str                         # billing_key enviado como reference/order_id
@@ -62,9 +87,15 @@ class WebhookIn(BaseModel):
 async def register_trial(user=Depends(get_current_user)) -> Dict[str, Any]:
     """
     Garante o registro do tenant e inicia o trial se não existir.
-    Idempotente: se já existir, apenas retorna o status.
-    Nunca deve derrubar com 500 por regra.
+    Admin (bypass): sempre ativo sem tocar no billing.
     """
+    if _is_admin_bypass(user):
+        return {
+            "ok": True,
+            "billing_key": None,
+            "status": {"active": True, "plan": "admin", "admin_bypass": True},
+        }
+
     bkey = _billing_key_from_user(user)
 
     # tenta ler status; se não existir, cria trial
@@ -77,7 +108,6 @@ async def register_trial(user=Depends(get_current_user)) -> Dict[str, Any]:
         try:
             ensure_trial(bkey)
         except Exception:
-            # segue; reconsulta já lida com indisponibilidade
             pass
 
     st = _safe_get_status(bkey)
@@ -88,7 +118,15 @@ async def register_trial(user=Depends(get_current_user)) -> Dict[str, Any]:
 async def billing_status(user=Depends(get_current_user)) -> Dict[str, Any]:
     """
     Retorna o status atual do billing (active, days_left, trial_ends_at, paid_until, plan...).
+    Admin (bypass): sempre ativo.
     """
+    if _is_admin_bypass(user):
+        return {
+            "ok": True,
+            "billing_key": None,
+            "status": {"active": True, "plan": "admin", "admin_bypass": True},
+        }
+
     bkey = _billing_key_from_user(user)
     st = _safe_get_status(bkey)
     return {"ok": True, "billing_key": bkey, "status": st}
@@ -99,7 +137,16 @@ async def checkout_link(body: CheckoutLinkIn, user=Depends(get_current_user)) ->
     """
     Normalmente criaria a ordem na GetNet e retornaria a URL real.
     Aqui simulamos: GETNET_CHECKOUT_BASE?ref=<billing_key>&return_url=<ret>
+    Admin (bypass): não precisa de checkout.
     """
+    if _is_admin_bypass(user):
+        return {
+            "ok": True,
+            "url": "about:blank",
+            "ref": None,
+            "admin_bypass": True,
+        }
+
     bkey = _billing_key_from_user(user)
     base = os.getenv("GETNET_CHECKOUT_BASE", "https://pay.getnet.com.br/checkout")
     ret = body.return_url or os.getenv("PAY_RETURN_URL") or "https://lunahia.com.br/pagamentos/getnet/"
@@ -119,7 +166,6 @@ async def webhook_getnet(payload: WebhookIn) -> Dict[str, Any]:
     try:
         mark_paid(payload.ref, days=payload.days, plan=payload.plan, status=payload.status)
     except Exception as e:
-        # não derruba com 500 – responde que não foi possível aplicar
         raise HTTPException(status_code=503, detail=f"Falha ao aplicar pagamento: {e}")
 
     return {"ok": True}
