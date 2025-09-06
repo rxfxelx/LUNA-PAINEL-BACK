@@ -1,4 +1,3 @@
-# app/services/billing.py
 from __future__ import annotations
 
 import hashlib
@@ -33,11 +32,26 @@ def ensure_trial(billing_key: str) -> Dict[str, Any]:
     Garante que exista um registro e que o trial esteja iniciado (idempotente).
     Retorna um snapshot básico do registro.
     """
+    trial_ends = _utcnow() + timedelta(days=TRIAL_DAYS)
+
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
+            # UPSERT idempotente
             cur.execute(
                 """
-                SELECT id, trial_started_at, trial_ends_at, paid_until, plan, last_payment_status
+                INSERT INTO billing_accounts
+                    (billing_key, created_at, trial_started_at, trial_ends_at)
+                VALUES
+                    (%s, NOW(), NOW(), %s)
+                ON CONFLICT (billing_key) DO NOTHING
+                """,
+                (billing_key, trial_ends),
+            )
+
+            # Lê o registro atualizado
+            cur.execute(
+                """
+                SELECT trial_started_at, trial_ends_at, paid_until, plan, last_payment_status
                   FROM billing_accounts
                  WHERE billing_key = %s
                 """,
@@ -45,26 +59,28 @@ def ensure_trial(billing_key: str) -> Dict[str, Any]:
             )
             row = cur.fetchone()
 
-            if not row:
-                trial_ends = _utcnow() + timedelta(days=TRIAL_DAYS)
-                cur.execute(
-                    """
-                    INSERT INTO billing_accounts
-                        (billing_key, created_at, trial_started_at, trial_ends_at)
-                    VALUES
-                        (%s, NOW(), NOW(), %s)
-                    RETURNING id, trial_started_at, trial_ends_at, paid_until, plan, last_payment_status
-                    """,
-                    (billing_key, trial_ends),
-                )
-                row = cur.fetchone()
+    if not row:
+        return {
+            "trial_started_at": None,
+            "trial_ends_at": None,
+            "paid_until": None,
+            "plan": None,
+            "last_payment_status": None,
+        }
+
+    # dict_row permite acesso por chave; mantém compat se vier tupla
+    def _get(r, k, i):
+        try:
+            return r[k]
+        except Exception:
+            return r[i]
 
     return {
-        "trial_started_at": row[1],
-        "trial_ends_at": row[2],
-        "paid_until": row[3],
-        "plan": row[4],
-        "last_payment_status": row[5],
+        "trial_started_at": _get(row, "trial_started_at", 0),
+        "trial_ends_at": _get(row, "trial_ends_at", 1),
+        "paid_until": _get(row, "paid_until", 2),
+        "plan": _get(row, "plan", 3),
+        "last_payment_status": _get(row, "last_payment_status", 4),
     }
 
 
@@ -97,15 +113,24 @@ def get_status(billing_key: str) -> Dict[str, Any]:
             "require_payment": False,
         }
 
-    trial_started, trial_ends, paid_until, plan, last_status = row
-    now = _utcnow()
+    def _get(r, k, i):
+        try:
+            return r[k]
+        except Exception:
+            return r[i]
 
+    trial_started = _get(row, "trial_started_at", 0)
+    trial_ends    = _get(row, "trial_ends_at", 1)
+    paid_until    = _get(row, "paid_until", 2)
+    plan          = _get(row, "plan", 3)
+    last_status   = _get(row, "last_payment_status", 4)
+
+    now = _utcnow()
     active = False
     days_left = 0
 
     if paid_until and paid_until > now:
         active = True
-        # arredonda para baixo em dias cheios
         days_left = max(0, (paid_until - now).days)
     elif trial_ends and trial_ends > now:
         active = True
@@ -135,23 +160,41 @@ def mark_paid(
     Atualiza também plan e last_payment_status.
     """
     now = _utcnow()
+    add_days = max(1, int(days))
+
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
+            # garante existência do registro (idempotente)
+            cur.execute(
+                """
+                INSERT INTO billing_accounts (billing_key, created_at, trial_started_at, trial_ends_at)
+                VALUES (%s, NOW(), NOW(), %s)
+                ON CONFLICT (billing_key) DO NOTHING
+                """,
+                (billing_key, now + timedelta(days=TRIAL_DAYS)),
+            )
+
             cur.execute(
                 "SELECT paid_until FROM billing_accounts WHERE billing_key = %s",
                 (billing_key,),
             )
             row = cur.fetchone()
-            base = row[0] if row and row[0] and row[0] > now else now
-            new_paid = base + timedelta(days=max(1, int(days)))
+            paid_atual = None
+            if row is not None:
+                try:
+                    paid_atual = row["paid_until"]
+                except Exception:
+                    paid_atual = row[0]
+
+            base = paid_atual if (paid_atual and paid_atual > now) else now
+            new_paid = base + timedelta(days=add_days)
 
             cur.execute(
                 """
                 UPDATE billing_accounts
                    SET paid_until = %s,
                        plan = COALESCE(%s, plan),
-                       last_payment_status = %s,
-                       updated_at = NOW()
+                       last_payment_status = %s
                  WHERE billing_key = %s
                 """,
                 (new_paid, plan, status, billing_key),
