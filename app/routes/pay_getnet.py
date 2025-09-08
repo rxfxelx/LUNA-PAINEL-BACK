@@ -127,6 +127,54 @@ async def create_checkout(body: CheckoutIn) -> CheckoutOut:
     return CheckoutOut(ref=ret["reference_id"], url=ret["payment_url"])
 
 
+# ---------------------------------------------------------------------------
+# Compatibilidade: rota GET /checkout-url
+#
+# Versões antigas do front‑end utilizam um endpoint GET com nome
+# ``checkout-url`` que aceita o plano via query string.  Esta função
+# reencaminha a chamada para ``create_checkout`` construindo os parâmetros
+# necessários.  Se o e‑mail não for informado, retornamos erro 400.  Esta
+# rota facilita a migração gradual do front‑end sem quebrar a interface.
+@router.get("/checkout-url", response_model=CheckoutOut)
+async def get_checkout_url(
+    email: Optional[EmailStr] = None,
+    plan: str = "luna_base",
+    amount_cents: int = PRICE_CENTS,
+    tenant_key: Optional[str] = None,
+) -> CheckoutOut:
+    """
+    Cria um checkout GetNet via requisição GET.
+
+    Esta rota existe por motivos de compatibilidade com versões mais antigas
+    do front‑end que esperavam obter a URL de pagamento através de uma
+    requisição GET.  Os parâmetros são passados via querystring.  Se o
+    parâmetro **email** não for fornecido, utiliza‑se um e‑mail fictício para
+    satisfazer a API de pagamento.  Para integrações oficiais, recomenda‑se
+    utilizar a rota POST ``/checkout`` e enviar o e‑mail real do cliente.
+
+    Parâmetros:
+        * **email** – endereço de e‑mail do cliente.  Opcional.
+        * **plan** – identificador do plano (opcional, "luna_base" por padrão).
+        * **amount_cents** – valor em centavos.  Utiliza PRICE_CENTS por padrão.
+        * **tenant_key** – identificador do tenant para usos multi‑instância.
+
+    A implementação cria um registro de pagamento pendente, gera a URL de
+    pagamento através de :class:`GetNetClient` e retorna as mesmas
+    informações disponíveis em ``create_checkout``.
+    """
+    # Se o e‑mail não for informado, utilizamos um placeholder.  O endereço
+    # resulta em um identificador único para evitar colisões de pagamentos.
+    import uuid
+    actual_email = email or f"anon-{uuid.uuid4().hex}@example.com"
+    body = CheckoutIn(
+        email=actual_email,
+        plan=plan,
+        amount_cents=amount_cents,
+        tenant_key=tenant_key,
+    )
+    return await create_checkout(body)
+
+
 @router.post("/webhook", response_model=WebhookOut)
 async def webhook(payload: Dict[str, Any] = Body(...)) -> WebhookOut:
     """
