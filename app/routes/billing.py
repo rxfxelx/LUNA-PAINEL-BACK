@@ -13,6 +13,7 @@ from app.services.billing import (
     get_status,
     mark_paid,
 )
+from app.pay.getnet_client import GetNetClient  # import here to avoid circular import
 
 router = APIRouter()
 
@@ -140,10 +141,27 @@ async def billing_status(user=Depends(get_current_user)) -> Dict[str, Any]:
 @router.post("/checkout-link")
 async def checkout_link(body: CheckoutLinkIn, user=Depends(get_current_user)) -> Dict[str, Any]:
     """
-    Normalmente criaria a ordem na GetNet e retornaria a URL real.
-    Aqui simulamos: GETNET_CHECKOUT_BASE?ref=<billing_key>&return_url=<ret>
-    Admin (bypass): não precisa de checkout.
+    Gera a URL de checkout para o cliente atual.
+
+    Este endpoint suporta dois modos de operação:
+
+    1. **Modo legado**: se a variável de ambiente ``GETNET_CHECKOUT_BASE`` estiver
+       definida, a URL de checkout será construída concatenando o valor dessa
+       base com o ``billing_key`` do usuário e um retorno opcional.  Esse
+       comportamento preserva a funcionalidade existente sem requerer
+       autenticação adicional.
+    2. **Integração real GetNet**: quando ``GETNET_CHECKOUT_BASE`` não está
+       definida, utiliza‐se a classe :class:`GetNetClient` para requisitar um
+       link de pagamento via API da GetNet.  A transação é identificada pelo
+       ``billing_key`` gerado a partir do token e host do usuário.  A URL de
+       retorno e a de notificação podem ser personalizadas através das
+       variáveis ``GETNET_RETURN_BASE``, ``PAY_RETURN_URL`` e
+       ``GETNET_NOTIFY_URL``.
+
+    Admin (bypass): usuários marcados como administradores não necessitam de
+    checkout; nesse caso a função retorna ``about:blank``.
     """
+    # Se for usuário com bypass, não há necessidade de cobrança.
     if _is_admin_bypass(user):
         return {
             "ok": True,
@@ -152,11 +170,56 @@ async def checkout_link(body: CheckoutLinkIn, user=Depends(get_current_user)) ->
             "admin_bypass": True,
         }
 
+    # Calcula a chave de cobrança (billing_key) a partir do JWT.
     bkey = _billing_key_from_user(user)
-    base = os.getenv("GETNET_CHECKOUT_BASE", "https://pay.getnet.com.br/checkout")
-    ret = body.return_url or os.getenv("PAY_RETURN_URL") or "https://lunahia.com.br/pagamentos/getnet/"
-    url = f"{base}?ref={bkey}&return_url={ret}"
-    return {"ok": True, "url": url, "ref": bkey}
+
+    # Caso o base legado esteja definido, mantém comportamento anterior.
+    checkout_base = os.getenv("GETNET_CHECKOUT_BASE")
+    if checkout_base:
+        # URL de retorno: prioriza valor enviado pelo corpo; senão lê PAY_RETURN_URL
+        # ou cai para PUBLIC_BASE_URL/pagamentos/getnet.
+        ret = body.return_url or os.getenv("PAY_RETURN_URL")
+        if not ret:
+            pb = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+            ret = f"{pb}/pagamentos/getnet/"
+        url = f"{checkout_base}?ref={bkey}&return_url={ret}"
+        return {"ok": True, "url": url, "ref": bkey}
+
+    # Modo API Real: utiliza GetNetClient para obter link.
+    try:
+        client = GetNetClient()
+        # Extrai e‑mail do usuário do JWT (pode estar em 'email' ou 'user_email').
+        email = (user.get("email") or user.get("user_email") or "").strip()
+        if not email:
+            raise HTTPException(status_code=400, detail="E‑mail ausente no token do usuário")
+        # Valor em centavos do plano.  Lê da env LUNA_PRICE_CENTS ou usa 34990.
+        amount_cents = int(os.getenv("LUNA_PRICE_CENTS") or 34990)
+        # Nome do plano usado na descrição.  Permite customização via LUNA_PLAN_NAME.
+        plan_name = os.getenv("LUNA_PLAN_NAME", "Luna AI")
+        description = f"Assinatura {plan_name}"
+        # Base pública da aplicação para compor URLs de retorno/notificação.
+        public_base = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+        # Define URL de retorno.  Prioriza body.return_url, depois env GETNET_RETURN_BASE.
+        return_base = (os.getenv("GETNET_RETURN_BASE") or f"{public_base}/pagamentos/getnet/sucesso").rstrip("/")
+        return_url = body.return_url or f"{return_base}?ref={bkey}"
+        # Define URL de notificação (webhook).  Usa GETNET_NOTIFY_URL ou
+        # cai para PUBLIC_BASE_URL/api/pay/getnet/webhook.
+        notify_url = (os.getenv("GETNET_NOTIFY_URL") or f"{public_base}/api/pay/getnet/webhook").rstrip("/")
+        # Chama a GetNet para gerar a URL de pagamento.
+        ret = await client.create_checkout(
+            amount_cents=amount_cents,
+            customer_email=email,
+            reference_id=bkey,
+            return_url=return_url,
+            notify_url=notify_url,
+            description=description,
+            metadata={"billing_key": bkey},
+        )
+        return {"ok": True, "url": ret["payment_url"], "ref": ret["reference_id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Falha ao iniciar checkout: {e}")
 
 
 @router.post("/webhook/getnet")
