@@ -52,17 +52,57 @@ def _is_admin_bypass(user: Dict[str, Any]) -> bool:
 
 def _billing_key_from_user(user: Dict[str, Any]) -> str:
     """
-    Monta o billing_key a partir do JWT. Valida token/host.
+    Monta um ``billing_key`` a partir do JWT do usuário.  Este helper suporta
+    tanto tokens de instância (quando ``token`` e ``host`` estão presentes no
+    payload) quanto tokens de usuário (quando ``sub`` inicia com ``user:`` ou
+    quando existe um ``email`` válido).  Para tokens de instância o
+    comportamento original é preservado, utilizando :func:`make_billing_key`.
+
+    Para tokens de usuário, o ``billing_key`` segue um dos formatos abaixo:
+
+    * ``uid:<id>`` – quando o claim ``sub`` possui o prefixo ``user:`` e
+      conseguirmos extrair o identificador numérico.
+    * ``ue:<hash>`` – quando apenas o e‑mail está disponível.  O hash é
+      calculado com HMAC-SHA256 a partir do e‑mail e do ``BILLING_SALT`` para
+      evitar expor diretamente o endereço.
+
+    Caso nenhum dado suficiente esteja presente no JWT, a função aborta com
+    ``HTTP 401``.
     """
     token = (user.get("token") or user.get("instance_token") or "").strip()
     host = (user.get("host") or "").strip()
     iid = user.get("instance_id")
-    if not token or not host:
-        raise HTTPException(status_code=401, detail="JWT inválido: sem token/host")
-    try:
-        return make_billing_key(token, host, iid)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
+
+    # Preferimos billing por instância quando token e host existem.  Isso
+    # mantém compatibilidade com a cobrança antiga baseada na UAZAPI.
+    if token and host:
+        try:
+            return make_billing_key(token, host, iid)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
+
+    # Caso não exista token/host, tratamos como JWT de usuário.  Tentamos
+    # extrair o id numérico do claim 'sub' (formato 'user:<id>').
+    sub = str(user.get("sub") or "")
+    if sub.startswith("user:"):
+        uid = sub.split(":", 1)[1]
+        if uid:
+            return f"uid:{uid}"
+
+    # Como fallback, usamos o e‑mail.  Quando há e‑mail disponível, geramos um
+    # digest HMAC‐SHA256 com o BILLING_SALT para não armazenar o endereço
+    # original como chave.  Isso garante unicidade e evita vazamento de PII.
+    email = (user.get("email") or user.get("user_email") or "").strip().lower()
+    if email:
+        import hashlib
+        import hmac
+        import os
+        salt = (os.getenv("BILLING_SALT") or "luna").encode()
+        digest = hmac.new(salt, email.encode(), hashlib.sha256).hexdigest()
+        return f"ue:{digest}"
+
+    # Se não conseguimos extrair nenhuma informação, negamos a solicitação.
+    raise HTTPException(status_code=401, detail="JWT inválido: sem token/host/email/sub")
 
 
 def _safe_get_status(bkey: str) -> Dict[str, Any]:
