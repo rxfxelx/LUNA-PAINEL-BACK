@@ -19,6 +19,9 @@ from .routes import (
     billing,
     users,           # login/cadastro por e-mail
 )
+# >>> novo import do router de instâncias Uazapi
+import app.routes.uazapi_instance as uazapi_instance
+
 from .auth import router as auth_router  # /api/auth/*
 from .pg import init_schema
 
@@ -105,6 +108,9 @@ app.include_router(crm.router,         prefix="/api",         tags=["crm"])
 app.include_router(media.router,       prefix="/api/media",   tags=["media"])
 app.include_router(lead_status.router, prefix="/api",         tags=["lead-status"])
 app.include_router(billing.router,     prefix="/api/billing", tags=["billing"])
+
+# >>> novas rotas para gerenciamento de instâncias Uazapi
+app.include_router(uazapi_instance.router, prefix="/api/uaz", tags=["uazapi"])
 
 # Healthcheck simples
 @app.get("/healthz")
