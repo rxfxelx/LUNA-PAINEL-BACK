@@ -57,9 +57,30 @@ class GetNetClient:
         """
 
         self.env = (os.getenv("GETNET_ENV") or "sandbox").strip().lower()
-        self.seller_id = (os.getenv("GETNET_SELLER_ID") or "").strip()
-        self.client_id = (os.getenv("GETNET_CLIENT_ID") or "").strip()
-        self.client_secret = (os.getenv("GETNET_CLIENT_SECRET") or "").strip()
+        # A partir de setembro/2025 a GetNet exige que todas as requisições
+        # sejam autenticadas com o Seller ID e um par de credenciais de cliente.
+        # Normalmente estes valores são fornecidos através de variáveis de
+        # ambiente definidas em ``GETNET_SELLER_ID``, ``GETNET_CLIENT_ID`` e
+        # ``GETNET_CLIENT_SECRET``.  Para evitar que o código quebre quando
+        # essas variáveis não estiverem presentes em ambientes de teste, nós
+        # fornecemos valores padrão lidos da documentação recebida pelo usuário.
+        # Caso você deseje utilizar suas próprias credenciais, defina as
+        # variáveis de ambiente correspondentes no contêiner ou no serviço
+        # de hospedagem.  As strings abaixo correspondem à conta de
+        # homologação disponibilizada pela GetNet e podem ser trocadas sem
+        # alterar a lógica de autenticação.
+        self.seller_id = (
+            os.getenv("GETNET_SELLER_ID")
+            or "17943e93-e7d2-423a-a026-ac3368bad649"
+        ).strip()
+        self.client_id = (
+            os.getenv("GETNET_CLIENT_ID")
+            or "8c4dbf87-fece-4349-8771-8fe6e261b241"
+        ).strip()
+        self.client_secret = (
+            os.getenv("GETNET_CLIENT_SECRET")
+            or "f435dd6e-6076-4dd2-a92d-9a13f0d8f527"
+        ).strip()
         # Optional override: if set, requests are proxied to this full URL rather
         # than built from the base URL and checkout endpoint.
         self.checkout_url = (os.getenv("GETNET_CHECKOUT_URL") or "").strip()
