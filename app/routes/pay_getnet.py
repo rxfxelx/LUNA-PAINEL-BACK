@@ -9,7 +9,7 @@ from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 
 from app.pay.getnet_client import GetNetClient
-from app.db.models_billing import (
+from app.models_billing import (
     init_billing_schema,
     create_pending_payment,
     update_payment_status,
@@ -231,3 +231,4 @@ async def status(ref: str):
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
