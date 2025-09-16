@@ -17,26 +17,22 @@ from .routes import (
     media,
     lead_status,
     billing,
-    users,           # login/cadastro por e-mail
+    users,
 )
-from .auth import router as auth_router  # /api/auth/*
+from .routes.users import router as auth_router  # login e registro de usuário
 from .pg import init_schema
 
-# ----------------------------- CORS ------------------------------------ #
-def _env_list(var: str) -> list[str]:
-    raw = (os.getenv(var) or "").strip()
-    if not raw:
-        return []
-    return [v.strip() for v in raw.split(",") if v.strip()]
 
 def allowed_origins() -> list[str]:
-    allowlist: set[str] = {
-        "https://www.lunahia.com.br",
-        "https://lunahia.com.br",
-        "https://luna-painel-front-git-main-iahelsenservice-7497s-projects.vercel.app",
-    }
-    for o in _env_list("FRONTEND_ORIGIN"):
-        allowlist.add(o)
+    allowlist = set()
+    # FRONTEND_ORIGINS: lista separada por vírgula
+    front_env = os.getenv("FRONTEND_ORIGINS", "")
+    if front_env:
+        for item in front_env.split(","):
+            item = item.strip()
+            if item:
+                allowlist.add(item)
+    # Allow localhost para testes
     if os.getenv("ALLOW_LOCALHOST", "1") == "1":
         allowlist.update(
             {
@@ -105,6 +101,10 @@ app.include_router(crm.router,         prefix="/api",         tags=["crm"])
 app.include_router(media.router,       prefix="/api/media",   tags=["media"])
 app.include_router(lead_status.router, prefix="/api",         tags=["lead-status"])
 app.include_router(billing.router,     prefix="/api/billing", tags=["billing"])
+
+# *** NOVO: rotas GetNet (checkout + webhook) ***
+from .routes import pay_getnet
+app.include_router(pay_getnet.router,  prefix="/api/pay/getnet", tags=["getnet"])
 
 # Healthcheck simples
 @app.get("/healthz")
