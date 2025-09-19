@@ -53,14 +53,16 @@ app = FastAPI(title="Luna Backend", version="1.0.0")
 # CORS — aceita lista e/ou regex
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins(),
-    allow_origin_regex=allowed_origin_regex(),
+    allow_origins=[
+        "https://www.lunahia.com.br",
+        "https://lunahia.com.br",  # opcional, se quiser aceitar sem www também
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],   # inclui Authorization
-    expose_headers=["*"],
-    max_age=86400,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
+    max_age=600,
 )
+
 
 # --------------------------- Startup ----------------------------------- #
 @app.on_event("startup")
