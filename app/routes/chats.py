@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 
 from app.routes.deps import get_uazapi_ctx
 from app.routes import ai as ai_routes
@@ -341,3 +341,25 @@ async def stream_chats(
             yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+# -------------------------------------------------------------------------------
+# CORS preflight handler
+#
+# Browsers send an HTTP OPTIONS request (preflight) before issuing a POST to
+# determine whether the server accepts the cross‑origin call.  Without an
+# explicit OPTIONS endpoint, FastAPI's CORSMiddleware should normally
+# intercept the request and respond with the appropriate CORS headers.
+# However, depending on deployment and proxying (e.g., on Railway or other
+# environments), the preflight can bypass the middleware and hit our
+# application directly, resulting in a 400 response and the front‑end seeing a
+# CORS error.  To ensure the preflight is always answered correctly, we
+# define a lightweight OPTIONS handler for the stream endpoint.  The
+# CORSMiddleware will attach the necessary CORS headers automatically.
+@router.options("/chats/stream", include_in_schema=False)
+async def options_chats_stream() -> Response:  # type: ignore[valid-type]
+    """
+    Respond with an empty 204 No Content for CORS preflight requests.  The
+    CORSMiddleware will still attach the necessary CORS headers to this
+    response based on the configured allowed origins, methods and headers.
+    """
+    return Response(status_code=204)
