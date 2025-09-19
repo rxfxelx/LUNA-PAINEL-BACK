@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Body, Query, Request
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 
 from app.routes.deps import get_uazapi_ctx
 from app.routes import ai as ai_routes
@@ -23,6 +25,87 @@ from app.services.lead_status import (  # type: ignore
 )
 
 router = APIRouter()
+
+# ---------------- util: CORS helpers ---------------- #
+def _load_allowed_origins() -> list[str]:
+    """
+    Lê FRONTEND_ORIGINS (CSV) e normaliza espaços.
+    Ex.: FRONTEND_ORIGINS="https://lunahia.com.br, https://www.lunahia.com.br, http://localhost:3000"
+    """
+    raw = os.getenv("FRONTEND_ORIGINS", "")
+    if not raw.strip():
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+def _origin_matches_regex(origin: str) -> bool:
+    pattern = os.getenv("FRONTEND_ORIGIN_REGEX", "").strip()
+    if not pattern:
+        return False
+    try:
+        return re.match(pattern, origin) is not None
+    except re.error:
+        return False
+
+def _resolve_cors_origin(request: Request) -> Optional[str]:
+    """
+    Retorna a origem (string) que deve ser refletida no Access-Control-Allow-Origin
+    OU None se não deve permitir.
+    Se CORS_ALLOW_CREDENTIALS=true, jamais retorna "*" (precisa ser origem específica).
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return None
+
+    allow_list = _load_allowed_origins()
+    allow_re = _origin_matches_regex(origin)
+    if origin in allow_list or allow_re:
+        # Se permitir credenciais, refletimos a origem específica.
+        if os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true":
+            return origin
+        # Sem credenciais, poderíamos retornar "*" — porém, para consistência e para
+        # proxies mais rígidos, preferimos refletir a origem aprovada.
+        return origin
+
+    return None
+
+def _cors_preflight_response(request: Request) -> Response:
+    """
+    Responde ao preflight com os cabeçalhos CORS adequados.
+    - Permite POST e OPTIONS.
+    - Ecoa os headers solicitados pelo navegador em Access-Control-Allow-Headers.
+    """
+    allowed_origin = _resolve_cors_origin(request)
+    if not allowed_origin:
+        # Origem não autorizada: responde 403 para deixar claro.
+        return Response(status_code=403)
+
+    # Quais headers o navegador quer usar na requisição real:
+    acrh = request.headers.get("access-control-request-headers", "authorization, content-type, x-instance-id")
+
+    headers = {
+        "Access-Control-Allow-Origin": allowed_origin,
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": acrh,
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+    }
+    if os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true":
+        headers["Access-Control-Allow-Credentials"] = "true"
+
+    return Response(status_code=204, headers=headers)
+
+def _attach_cors_headers_to_response(request: Request, resp: Response) -> Response:
+    """
+    Garante que a resposta real (POST /chats/stream) também carregue os headers CORS.
+    Útil quando há proxies/CDN que podem interferir no middleware.
+    """
+    allowed_origin = _resolve_cors_origin(request)
+    if allowed_origin:
+        resp.headers.setdefault("Access-Control-Allow-Origin", allowed_origin)
+        resp.headers.setdefault("Vary", "Origin")
+        if os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true":
+            resp.headers.setdefault("Access-Control-Allow-Credentials", "true")
+    return resp
 
 # ---------------- util: extrai instance_id do JWT/headers ---------------- #
 def _b64url_to_bytes(s: str) -> bytes:
@@ -340,26 +423,15 @@ async def stream_chats(
             # failsafe: nunca transforma em 500; retorna NDJSON de erro
             yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\n"
 
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
+    # Resposta do stream com cabeçalhos CORS aplicados
+    resp = StreamingResponse(gen(), media_type="application/x-ndjson")
+    return _attach_cors_headers_to_response(request, resp)
 
-# -------------------------------------------------------------------------------
-# CORS preflight handler
-#
-# Browsers send an HTTP OPTIONS request (preflight) before issuing a POST to
-# determine whether the server accepts the cross‑origin call.  Without an
-# explicit OPTIONS endpoint, FastAPI's CORSMiddleware should normally
-# intercept the request and respond with the appropriate CORS headers.
-# However, depending on deployment and proxying (e.g., on Railway or other
-# environments), the preflight can bypass the middleware and hit our
-# application directly, resulting in a 400 response and the front‑end seeing a
-# CORS error.  To ensure the preflight is always answered correctly, we
-# define a lightweight OPTIONS handler for the stream endpoint.  The
-# CORSMiddleware will attach the necessary CORS headers automatically.
+# ------------------ CORS Preflight explícito ------------------ #
 @router.options("/chats/stream", include_in_schema=False)
-async def options_chats_stream() -> Response:  # type: ignore[valid-type]
+async def options_chats_stream(request: Request) -> Response:
     """
-    Respond with an empty 204 No Content for CORS preflight requests.  The
-    CORSMiddleware will still attach the necessary CORS headers to this
-    response based on the configured allowed origins, methods and headers.
+    Responde ao preflight CORS de /chats/stream com 204 e cabeçalhos adequados.
+    Evita 400 em proxies/ambientes que não deixam o CORSMiddleware interceptar.
     """
-    return Response(status_code=204)
+    return _cors_preflight_response(request)
