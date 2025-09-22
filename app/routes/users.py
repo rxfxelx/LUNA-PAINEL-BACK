@@ -1,9 +1,12 @@
 from __future__ import annotations
-from typing import Dict, Any
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, EmailStr
+from typing import Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
-import jwt, os, logging
+import logging
+import os
+import jwt
+
+from fastapi import APIRouter, HTTPException, Request, Body
+from pydantic import BaseModel, EmailStr
 
 from app.services.users import (
     create_user,
@@ -11,6 +14,14 @@ from app.services.users import (
     verify_password,
     touch_last_login,
 )
+
+# Tenta integrar com serviço de instâncias, se existir
+try:
+    # implemente esta função em app/services/instances.py:
+    # def attach_instance_to_user(user_id: int, instance_token: str) -> dict: ...
+    from app.services.instances import attach_instance_to_user  # type: ignore
+except Exception:  # pragma: no cover
+    attach_instance_to_user = None  # fallback: segue sem persistir, apenas loga
 
 router = APIRouter()
 log = logging.getLogger("uvicorn.error")
@@ -40,6 +51,9 @@ def _issue_user_jwt(user: Dict[str, Any]) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
+# ------------------------------------------------------------------------------
+# Modelos
+# ------------------------------------------------------------------------------
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
@@ -50,6 +64,48 @@ class LoginIn(BaseModel):
     password: str
 
 
+class InstanceConnectIn(BaseModel):
+    """
+    Body para conectar uma instância à conta do usuário logado.
+    - Envie apenas o token da instância no body.
+    - O email do usuário é obtido do JWT (Authorization: Bearer <jwt>).
+    """
+    token: str
+
+
+# ------------------------------------------------------------------------------
+# Helpers de autenticação
+# ------------------------------------------------------------------------------
+def _jwt_payload_from_request(req: Request) -> Dict[str, Any]:
+    """
+    Extrai e valida o JWT do header Authorization. Retorna o payload (dict).
+    Levanta HTTP 401 se ausente ou inválido.
+    """
+    auth = req.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "Authorization header ausente ou inválido")
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        return payload if isinstance(payload, dict) else {}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Sessão expirada. Faça login novamente.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Token inválido. Faça login novamente.")
+
+
+def _mask_token(t: str) -> str:
+    """Ofusca token para log/response (exibe início e fim)."""
+    if not t:
+        return ""
+    if len(t) <= 10:
+        return t
+    return f"{t[:6]}…{t[-4:]}"
+
+
+# ------------------------------------------------------------------------------
+# Rotas de usuário (conta)
+# ------------------------------------------------------------------------------
 @router.post("/register")
 def register(body: RegisterIn):
     try:
@@ -75,3 +131,55 @@ def login(body: LoginIn):
     except Exception:
         log.exception("Erro no login")
         raise HTTPException(500, "Erro interno")
+
+
+# ------------------------------------------------------------------------------
+# Rotas de instância (vínculo da instância à conta)
+# ------------------------------------------------------------------------------
+@router.post("/instances/connect")
+def connect_instance(request: Request, body: InstanceConnectIn = Body(...)):
+    """
+    Conecta uma instância à conta do usuário autenticado.
+
+    Fluxo:
+    - Front envia Authorization: Bearer <jwt> (do /login).
+    - Body contém apenas {"token": "<token_da_instancia>"}.
+    - Backend descobre o email a partir do JWT e vincula a instância ao usuário.
+    """
+    # 1) Extrai e valida JWT, obtém e-mail
+    payload = _jwt_payload_from_request(request)
+    email = str(payload.get("email") or "").strip().lower()
+    if not email:
+        # Nossa emissão sempre inclui 'email'; se não veio, algo está errado
+        raise HTTPException(401, "JWT sem e-mail. Faça login novamente.")
+
+    # 2) Busca usuário no banco
+    u = get_user_by_email(email)
+    if not u:
+        raise HTTPException(404, "Usuário não encontrado")
+
+    instance_token = body.token.strip()
+    if not instance_token:
+        raise HTTPException(422, "token da instância é obrigatório")
+
+    # 3) Persiste vínculo user <-> instance (se serviço existir)
+    if attach_instance_to_user:
+        try:
+            result = attach_instance_to_user(user_id=u["id"], instance_token=instance_token)  # type: ignore
+        except Exception:
+            log.exception("Falha ao vincular instância ao usuário")
+            raise HTTPException(500, "Falha ao vincular instância")
+    else:
+        # Sem serviço de instância; não falha, mas avisa nos logs.
+        log.warning(
+            "attach_instance_to_user indisponível. Vínculo NÃO foi persistido. user=%s, token=%s",
+            email, _mask_token(instance_token)
+        )
+        result = {"persisted": False, "note": "attach_instance_to_user ausente"}
+
+    return {
+        "ok": True,
+        "user": {"id": u.get("id"), "email": email},
+        "instance": {"token": _mask_token(instance_token)},
+        "result": result,
+    }
