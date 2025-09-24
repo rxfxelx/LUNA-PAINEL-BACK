@@ -19,7 +19,28 @@ from .routes import (
     billing,
     users,
 )
-from .routes.users import router as auth_router  # login e registro de usuário
+
+# -----------------------------------------------------------------------------
+# Autenticação da instância (UAZAPI)
+#
+# O backend expõe dois conjuntos de rotas de autenticação:
+#  - app/routes/users.py: login/registro de usuários (e‑mail/senha) e conexão de
+#    instâncias à conta do usuário (/api/users/*).
+#  - app/auth.py: login da instância via token da UAZAPI, que retorna um JWT
+#    contendo apenas informações da instância (token, host etc.).
+#
+# No código original, as rotas de usuário eram registradas duas vezes: uma vez
+# em /api/users e, erroneamente, também em /api/auth. Isso fazia com que
+# /api/auth/login apontasse para o endpoint de login de usuário, exigindo
+# e‑mail e senha. No front‑end, a tela de “Conectar instância” chama
+# /api/auth/login com apenas o token da instância, mas o backend tratava esse
+# endpoint como login de usuário e retornava um erro reclamando de e‑mail/senha.
+#
+# Para corrigir isso, importamos o router correto de app/auth.py para a
+# montagem de /api/auth. Assim, /api/auth/login atenderá à rota de login da
+# instância, aceitando somente o token (e opcionalmente host/label). As
+# rotas de usuário continuam sob /api/users.
+from .auth import router as auth_router  # login via token da instância
 from .pg import init_schema
 
 
