@@ -34,8 +34,26 @@ SELLER_ID = os.getenv("GETNET_SELLER_ID") or ""
 
 @router.on_event("startup")
 async def _startup() -> None:
-    # garante tabelas
-    await init_billing_schema()
+    """
+    Inicializa o schema de billing de forma segura.
+
+    A criação das tabelas de billing depende de uma conexão com o banco
+    configurado via ``DATABASE_URL``. Em ambientes onde o banco não está
+    disponível (por exemplo, durante o desenvolvimento local ou quando a
+    funcionalidade de pagamentos não foi configurada), a tentativa de criar o
+    schema poderia causar a falha total da aplicação durante o startup.
+
+    Para evitar que a integração de cobrança impeça o funcionamento das demais
+    rotas (como CRM e UAZAPI), a chamada para :func:`init_billing_schema`
+    é envolvida em um bloco ``try/except``.  Em caso de erro, o problema é
+    registrado no log e o servidor continua inicializando normalmente.
+    """
+    try:
+        await init_billing_schema()
+    except Exception as exc:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
+        logger.error("Falha ao inicializar schema de billing: %s", exc)
 
 
 # =========================
