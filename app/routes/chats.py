@@ -380,7 +380,7 @@ async def stream_chats(
                             except Exception:
                                 pass
                     item["_last_ts"] = last_ts
-                    return last_ts, json.dumps(item, ensure_ascii=False) + "\n"
+                    return last_ts, json.dumps(item, ensure_ascii=False) + "\\n"
 
                 while count < max_total:
                     payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
@@ -388,13 +388,13 @@ async def stream_chats(
 
                     r = await cli.post(url, json=payload, headers=headers)
                     if r.status_code >= 400:
-                        yield json.dumps({"error": r.text}) + "\n"
+                        yield json.dumps({"error": r.text}) + "\\n"
                         return
 
                     try:
                         data = r.json()
                     except Exception:
-                        yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\n"
+                        yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\\n"
                         return
 
                     chunk = _normalize_items(data)["items"]
@@ -408,7 +408,7 @@ async def stream_chats(
                         try:
                             results.append(await fut)
                         except Exception as e:
-                            results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
+                            results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\\n"))
 
                     for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
                         yield line
@@ -421,7 +421,7 @@ async def stream_chats(
                     offset += page_size
         except Exception as e:
             # failsafe: nunca transforma em 500; retorna NDJSON de erro
-            yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\n"
+            yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\\n"
 
     # Resposta do stream com cabeçalhos CORS aplicados
     resp = StreamingResponse(gen(), media_type="application/x-ndjson")
