@@ -2,16 +2,18 @@
 Stripe payment integration routes for Luna.
 
 This module implements a minimal integration with Stripe Checkout for
-recurring subscription payments.  Instead of interacting directly with
+recurring subscription payments. Instead of interacting directly with
 credit card data (as the previous GetNet integration did), Stripe
-provides a hosted checkout page.  Your backend only needs to create a
-Checkout Session and redirect the user to the ``session.url``.  When
+provides a hosted checkout page. Your backend only needs to create a
+Checkout Session and redirect the user to the ``session.url``. When
 payments succeed or fail, Stripe sends webhook events that we use to
-update our own billing records.  For more details on how Stripe
-Checkout works see the official documentation, which describes that
-you create a checkout session server‑side, redirect the customer to
-Stripe, and then fulfill the order via a webhook upon receiving the
-``checkout.session.completed`` or ``invoice.paid`` event【436761317421081†L145-L152】.
+update our own billing records.
+
+Flow (resumo):
+1) Criar sessão via /checkout (ou /checkout-url) e redirecionar para `session.url`.
+2) Stripe chama /webhook com eventos (ex.: invoice.paid, invoice.payment_failed).
+3) No paid: marcamos o pagamento como "paid" e deixamos o tenant ativo por 1 mês.
+4) No failed/cancel: atualizamos o pagamento para "failed" e desativamos quando necessário.
 """
 
 from __future__ import annotations
@@ -38,20 +40,19 @@ router = APIRouter()
 # -----------------------------------------------------------------------------
 # Stripe configuration
 #
-# The following environment variables must be set in your deployment to enable
-# Stripe payments:
+# Env vars esperadas:
+#   STRIPE_SECRET_KEY      – secret key da Stripe (obrigatório)
+#   STRIPE_PRICE_ID        – price (recorrente) do plano no Stripe (obrigatório)
+#   STRIPE_WEBHOOK_SECRET  – secret para validar a assinatura do webhook (opcional em dev)
+#   PUBLIC_BASE_URL        – base pública do front (para compor success/cancel)
+#   STRIPE_RETURN_BASE     – (opcional) override do success
+#   STRIPE_CANCEL_BASE     – (opcional) override do cancel
+#   STRIPE_NOTIFY_URL      – (opcional) URL pública do webhook (apenas informativa; não usada no código)
+#   LUNA_PRICE_CENTS       – valor em centavos usado no registro local (não afeta Stripe)
 #
-#   STRIPE_SECRET_KEY      – your Stripe secret API key
-#   STRIPE_PRICE_ID        – the price ID for your subscription plan
-#   STRIPE_WEBHOOK_SECRET  – signing secret for webhook verification (optional in dev)
-#   PUBLIC_BASE_URL        – base URL of your front‑end (used to compose return URLs)
-#   STRIPE_RETURN_BASE     – override for success page (defaults to PUBLIC_BASE_URL/pagamentos/stripe/sucesso)
-#   STRIPE_CANCEL_BASE     – override for cancel/error page (defaults to PUBLIC_BASE_URL/pagamentos/stripe/cancelado)
-#   STRIPE_NOTIFY_URL      – override for webhook endpoint (defaults to PUBLIC_BASE_URL/api/pay/stripe/webhook)
-#   LUNA_PRICE_CENTS       – price in cents used to record the amount locally
-#
-# All parameters other than STRIPE_SECRET_KEY and STRIPE_PRICE_ID are optional.
-# If required variables are missing, the checkout route will return HTTP 500.
+# Observação: o endpoint público REAL do webhook é o do backend:
+#   .../api/pay/stripe/webhook
+# Configure isso no Dashboard da Stripe apontando para o domínio público do backend.
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()
@@ -60,19 +61,12 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 stripe.api_key = STRIPE_SECRET_KEY or None
 
 PUBLIC_BASE = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-# Ajustamos as URLs de retorno e de cancelamento para apontarem para a raiz da
-# aplicação ao invés de depender de páginas estáticas na pasta `pagamentos`,
-# que foi removida do front‑end.  As variáveis de ambiente
-# STRIPE_RETURN_BASE e STRIPE_CANCEL_BASE continuam com prioridade caso
-# estejam definidas.
+# Retornos apontam para a RAIZ do site (páginas estáticas /pagamentos foram removidas).
 RETURN_BASE = (os.getenv("STRIPE_RETURN_BASE") or f"{PUBLIC_BASE}/").rstrip("/")
 CANCEL_BASE = (os.getenv("STRIPE_CANCEL_BASE") or f"{PUBLIC_BASE}/").rstrip("/")
+# Apenas referência para você configurar na Stripe; não é usado diretamente abaixo.
 NOTIFY_URL = (os.getenv("STRIPE_NOTIFY_URL") or f"{PUBLIC_BASE}/api/pay/stripe/webhook").rstrip("/")
 
-# Default plan price (for storing in our own database).  This is only used
-# locally; Stripe uses the price defined by STRIPE_PRICE_ID when creating
-# the session.  We default to the same 34990 cents used by GetNet if
-# LUNA_PRICE_CENTS is not defined.
 DEFAULT_PRICE_CENTS = int(os.getenv("LUNA_PRICE_CENTS") or 34990)
 
 
@@ -81,17 +75,10 @@ class CheckoutIn(BaseModel):
     """
     Input payload for creating a checkout session.
 
-    ``email`` – customer's email address.  Required by Stripe to prefill the
-                checkout page and link the subscription.
-    ``plan`` – identifier of the plan within our application.  This value is
-               stored in the metadata sent to Stripe so it can be retrieved
-               during webhook processing.
-    ``amount_cents`` – price of the plan in cents.  This is used only to
-                       record the pending payment locally; Stripe charges
-                       according to ``STRIPE_PRICE_ID``.  Defaults to the
-                       value configured via ``LUNA_PRICE_CENTS`` or 34990.
-    ``tenant_key`` – optional tenant identifier.  If not provided, the
-                    customer's email is used.
+    email – e‑mail do cliente (prefill e vínculo da assinatura).
+    plan – identificador interno do plano (vai nas metadatas).
+    amount_cents – valor usado apenas no registro local (Stripe cobra pelo PRICE).
+    tenant_key – chave do tenant na nossa base; se não vier, usamos o e‑mail.
     """
     email: EmailStr
     plan: str = Field(default="luna_base")
@@ -101,12 +88,10 @@ class CheckoutIn(BaseModel):
 
 class CheckoutOut(BaseModel):
     """
-    Response returned after creating a checkout session.
+    Response for checkout creation.
 
-    ``ref`` – unique reference for this payment in our system.  It is also
-             stored as the ``client_reference_id`` and metadata in Stripe so
-             that webhook events can be mapped back to our records.
-    ``url`` – Stripe hosted URL to which the customer should be redirected.
+    ref – referência interna do pagamento.
+    url – URL hosted do Stripe para redirecionar o cliente.
     """
     ref: str
     url: str
@@ -114,12 +99,10 @@ class CheckoutOut(BaseModel):
 
 # ---------------------------- Helper functions -------------------------------
 def _build_success_url(ref: str) -> str:
-    """Compose a success URL using the configured RETURN_BASE and ref."""
     return f"{RETURN_BASE}?ref={ref}"
 
 
 def _build_cancel_url(ref: str) -> str:
-    """Compose a cancel URL using the configured CANCEL_BASE and ref."""
     return f"{CANCEL_BASE}?ref={ref}"
 
 
@@ -127,28 +110,16 @@ def _build_cancel_url(ref: str) -> str:
 @router.post("/checkout", response_model=CheckoutOut)
 async def create_checkout(body: CheckoutIn) -> CheckoutOut:
     """
-    Initiate a new Stripe Checkout session for a subscription.
-
-    The backend first records a pending payment in our database via
-    ``create_pending_payment`` with status ``pending``.  It then calls
-    ``stripe.checkout.Session.create`` to obtain a URL hosted by Stripe.
-    The ``client_reference_id`` and ``metadata`` are used to store our
-    internal reference so that we can correlate webhook events back to this
-    record【193457525688558†L105-L112】.  Any error during this process will cause
-    the request to fail with HTTP 503.
+    Cria uma sessão de Stripe Checkout (modo assinatura) e retorna a URL.
     """
-    # Fail fast if Stripe is not properly configured
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
         raise HTTPException(status_code=500, detail="Stripe não configurado.")
 
-    # Generate our own reference ID and tenant key
+    # Referência interna
     ref = f"st_{uuid.uuid4().hex}"
     tenant_key = body.tenant_key or str(body.email)
 
-    # Record a pending payment in our own database.  We perform this in a
-    # try/except because we do not want to block the customer if our DB is
-    # temporarily unavailable.  The raw field is populated later in the
-    # webhook once we have full Stripe data.
+    # 1) cria/atualiza registro local "pending" (não bloqueia o fluxo)
     try:
         await create_pending_payment(
             reference_id=ref,
@@ -159,11 +130,10 @@ async def create_checkout(body: CheckoutIn) -> CheckoutOut:
             raw=None,
         )
     except Exception:
-        # In case of failure we still proceed; pending payments can be
-        # reconciled later.
+        # Em caso de falha local, seguimos; o webhook poderá reconciliar.
         pass
 
-    # Attempt to create the Stripe Checkout Session
+    # 2) gera sessão de checkout no Stripe
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
@@ -172,9 +142,7 @@ async def create_checkout(body: CheckoutIn) -> CheckoutOut:
             cancel_url=_build_cancel_url(ref),
             client_reference_id=ref,
             customer_email=str(body.email),
-            # Store metadata at both the session and subscription levels so
-            # that we can retrieve it in webhook events.  Subscription
-            # metadata is propagated to invoices and subscription objects.
+            # Metadata na sessão e na assinatura para correlacionar no webhook
             metadata={
                 "reference_id": ref,
                 "tenant_key": tenant_key,
@@ -193,11 +161,10 @@ async def create_checkout(body: CheckoutIn) -> CheckoutOut:
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Falha ao criar sessão de pagamento: {e}")
 
-    # Update status to pending and record minimal info about the session
+    # 3) persiste "pending" com o session_id
     try:
         await update_payment_status(ref, "pending", raw={"session_id": session.id})
     except Exception:
-        # Ignore errors – they can be reconciled later
         pass
 
     return CheckoutOut(ref=ref, url=session.url)
@@ -211,12 +178,8 @@ async def get_checkout_url(
     tenant_key: Optional[str] = None,
 ) -> CheckoutOut:
     """
-    Convenience endpoint to generate a checkout session via GET.
-
-    This mirrors the behaviour of the original GetNet integration: if the
-    ``email`` parameter is omitted we generate an anonymous address.  All
-    parameters are forwarded to ``create_checkout``.  Using a GET request
-    allows simple redirection from a static payment page in the front‑end.
+    Versão GET para facilitar redirecionamento a partir do front.
+    Se `email` não for enviado, criamos um anônimo (apenas para teste).
     """
     import uuid as _uuid
     actual_email: EmailStr = email or EmailStr(f"anon-{_uuid.uuid4().hex}@example.com")  # type: ignore
@@ -233,43 +196,35 @@ async def get_checkout_url(
 @router.post("/webhook")
 async def stripe_webhook(request: Request) -> Dict[str, Any]:
     """
-    Stripe webhook endpoint.
+    Webhook da Stripe.
 
-    Stripe sends various events to this endpoint.  We verify the signature
-    using ``STRIPE_WEBHOOK_SECRET`` (if configured) and then handle relevant
-    events.  The most important events are ``invoice.paid`` (indicating the
-    first or subsequent subscription invoice has been successfully paid),
-    ``invoice.payment_failed`` (payment failure) and ``customer.subscription.deleted``
-    (subscription cancelled).  For paid invoices we mark the payment as paid
-    and activate the tenant for one month.  For failed payments we mark the
-    payment as failed.  When a subscription is deleted we also deactivate the
-    tenant.  All other events are ignored.
+    - invoice.paid: marca pagamento como "paid" e ativa o tenant por 1 mês.
+    - invoice.payment_failed: marca pagamento como "failed".
+    - customer.subscription.deleted: marca "failed" e desativa o tenant.
     """
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     event: Any
-    # Verify the signature if a secret is provided; allow unsigned payloads in dev
+
+    # Com secret -> valida assinatura; sem secret (homolog/dev) -> parse JSON simples
     if STRIPE_WEBHOOK_SECRET:
         try:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, STRIPE_WEBHOOK_SECRET
-            )
+            # `payload` é bytes; a SDK aceita bytes aqui
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Webhook signature verification failed: {e}")
     else:
         try:
-            # Fallback: parse the JSON without signature verification
-            event = json.loads(payload)
+            # Em dev, quando não há secret, precisamos decodificar bytes -> str
+            event = json.loads(payload.decode("utf-8"))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
 
     event_type = event.get("type")
-    data_object = event.get("data", {}).get("object", {})
+    data_object = event.get("data", {}).get("object", {})  # invoice/subscription/etc.
 
-    # Handle invoice paid events
+    # ---------------- invoice.paid ----------------
     if event_type == "invoice.paid":
-        # The invoice contains the subscription id; we retrieve the subscription
-        # to access the metadata with our reference id and tenant key.
         subscription_id = data_object.get("subscription")
         if subscription_id:
             try:
@@ -285,9 +240,7 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                     except Exception:
                         pass
                     try:
-                        # Extend the tenant by one month (30 days).  Stripe
-                        # subscriptions are recurring monthly, so this keeps
-                        # the tenant active until the next invoice is paid.
+                        # Ativa por 1 mês — o ciclo seguinte será cobrado pela Stripe
                         await ensure_tenant_active(
                             tenant_key=tenant_key,
                             email=email,
@@ -297,9 +250,10 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                     except Exception:
                         pass
             except Exception:
+                # Não quebra o webhook; Stripe só precisa de 2xx
                 pass
 
-    # Handle invoice payment failures
+    # ---------------- invoice.payment_failed ----------------
     elif event_type == "invoice.payment_failed":
         subscription_id = data_object.get("subscription")
         if subscription_id:
@@ -315,7 +269,7 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # Handle subscription cancellations
+    # ---------------- customer.subscription.deleted ----------------
     elif event_type == "customer.subscription.deleted":
         meta = data_object.get("metadata", {}) or {}
         ref = meta.get("reference_id")
@@ -331,6 +285,5 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # Return a simple acknowledgement.  Stripe expects a 2xx response to
-    # consider the event delivered successfully.
+    # Stripe espera apenas um 2xx para considerar entregue
     return {"ok": True}
