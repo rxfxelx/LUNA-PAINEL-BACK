@@ -126,8 +126,13 @@ app.include_router(lead_status.router, prefix="/api",         tags=["lead-status
 app.include_router(billing.router,     prefix="/api/billing", tags=["billing"])
 
 # *** NOVO: rotas GetNet (checkout + webhook) ***
-from .routes import pay_getnet
-app.include_router(pay_getnet.router,  prefix="/api/pay/getnet", tags=["getnet"])
+# Import only the Stripe payment routes.  The legacy GetNet integration has
+# been fully removed from this codebase, so we no longer import or register
+# the pay_getnet router.
+from .routes import pay_stripe
+
+# Inclui as rotas de pagamento.  Somente Stripe está disponível agora.
+app.include_router(pay_stripe.router, prefix="/api/pay/stripe", tags=["stripe"])
 
 # Healthcheck simples
 @app.get("/healthz")
