@@ -8,7 +8,8 @@ from typing import Any, Dict, Optional
 
 from app.pg import get_pool  # usa o pool do psycopg_pool
 
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS") or 7)
+# Número de dias do período de testes gratuito.  Ajustado para 14 dias por padrão.
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS") or 14)
 _SALT = (os.getenv("BILLING_SALT") or "luna").encode()
 
 
