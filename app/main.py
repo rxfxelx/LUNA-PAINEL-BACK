@@ -19,12 +19,13 @@ from .routes import (
     billing,
     users,
 )
+from .routes import pay_stripe  # ✅ rotas de pagamento (Stripe)
 
 # -----------------------------------------------------------------------------
 # Autenticação da instância (UAZAPI)
 #
 # O backend expõe dois conjuntos de rotas de autenticação:
-#  - app/routes/users.py: login/registro de usuários (e‑mail/senha) e conexão de
+#  - app/routes/users.py: login/registro de usuários (e-mail/senha) e conexão de
 #    instâncias à conta do usuário (/api/users/*).
 #  - app/auth.py: login da instância via token da UAZAPI, que retorna um JWT
 #    contendo apenas informações da instância (token, host etc.).
@@ -32,9 +33,9 @@ from .routes import (
 # No código original, as rotas de usuário eram registradas duas vezes: uma vez
 # em /api/users e, erroneamente, também em /api/auth. Isso fazia com que
 # /api/auth/login apontasse para o endpoint de login de usuário, exigindo
-# e‑mail e senha. No front‑end, a tela de “Conectar instância” chama
+# e-mail e senha. No front-end, a tela de “Conectar instância” chama
 # /api/auth/login com apenas o token da instância, mas o backend tratava esse
-# endpoint como login de usuário e retornava um erro reclamando de e‑mail/senha.
+# endpoint como login de usuário e retornava um erro reclamando de e-mail/senha.
 #
 # Para corrigir isso, importamos o router correto de app/auth.py para a
 # montagem de /api/auth. Assim, /api/auth/login atenderá à rota de login da
@@ -46,7 +47,7 @@ from .pg import init_schema
 
 def allowed_origins() -> list[str]:
     allowlist = set()
-    # FRONTEND_ORIGINS: lista separada por vírgula
+    # FRONTEND_ORIGINS: lista separada por vírgula (ex.: "https://a.com,https://b.com")
     front_env = os.getenv("FRONTEND_ORIGINS", "")
     if front_env:
         for item in front_env.split(","):
@@ -72,15 +73,20 @@ def allowed_origin_regex() -> str | None:
 app = FastAPI(title="Luna Backend", version="1.0.0")
 
 # CORS — aceita lista e/ou regex
+# (mantém os dois domínios fixos e soma os do .env FRONTEND_ORIGINS)
+_default_origins = {
+    "https://www.lunahia.com.br",
+    "https://lunahia.com.br",  # opcional, sem www
+}
+_env_origins = set(allowed_origins())
+_all_origins = sorted(_default_origins.union(_env_origins))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.lunahia.com.br",
-        "https://lunahia.com.br",  # opcional, se quiser aceitar sem www também
-    ],
+    allow_origins=_all_origins,
+    allow_origin_regex=allowed_origin_regex(),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept"],
+    allow_methods=["*"],          # ⬅ preflight liberado
+    allow_headers=["*"],          # ⬅ preflight liberado
     max_age=600,
 )
 
@@ -90,7 +96,7 @@ app.add_middleware(
 async def _startup():
     logger = logging.getLogger("uvicorn.error")
     logger.info("Inicializando Luna Backend.")
-    logger.info("CORS allow_origins: %s", allowed_origins())
+    logger.info("CORS allow_origins: %s", _all_origins)
     logger.info("CORS allow_origin_regex: %s", allowed_origin_regex())
 
     db_url = os.getenv("DATABASE_URL") or ""
@@ -125,14 +131,8 @@ app.include_router(media.router,       prefix="/api/media",   tags=["media"])
 app.include_router(lead_status.router, prefix="/api",         tags=["lead-status"])
 app.include_router(billing.router,     prefix="/api/billing", tags=["billing"])
 
-# *** NOVO: rotas GetNet (checkout + webhook) ***
-# Import only the Stripe payment routes.  The legacy GetNet integration has
-# been fully removed from this codebase, so we no longer import or register
-# the pay_getnet router.
-from .routes import pay_stripe
-
-# Inclui as rotas de pagamento.  Somente Stripe está disponível agora.
-app.include_router(pay_stripe.router, prefix="/api/pay/stripe", tags=["stripe"])
+# Pagamentos (Stripe: checkout + webhook)
+app.include_router(pay_stripe.router,  prefix="/api/pay/stripe", tags=["stripe"])
 
 # Healthcheck simples
 @app.get("/healthz")
