@@ -9,3 +9,4 @@ bcrypt>=4.1
 python-multipart 
 pydantic[email]>=2.6
 asyncpg>=0.29.0
+stripe>=8.0
