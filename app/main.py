@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # Rotas internas
@@ -35,7 +35,7 @@ from .routes import pay_stripe  # ✅ rotas de pagamento (Stripe)
 # /api/auth/login apontasse para o endpoint de login de usuário, exigindo
 # e-mail e senha. No front-end, a tela de “Conectar instância” chama
 # /api/auth/login com apenas o token da instância, mas o backend tratava esse
-# endpoint como login de usuário e retornava um erro reclamando de e-mail/senha.
+# endpoint como login de usuário e retornava um erro reclamando de e‑mail/senha.
 #
 # Para corrigir isso, importamos o router correto de app/auth.py para a
 # montagem de /api/auth. Assim, /api/auth/login atenderá à rota de login da
@@ -138,3 +138,8 @@ app.include_router(pay_stripe.router,  prefix="/api/pay/stripe", tags=["stripe"]
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+# Catch‑all para preflight (reforço ao CORSMiddleware)
+@app.options("/{rest_of_path:path}", include_in_schema=False)
+async def _cors_preflight_catchall(rest_of_path: str):
+    return Response(status_code=204)
