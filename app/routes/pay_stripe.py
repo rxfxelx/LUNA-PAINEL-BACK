@@ -60,8 +60,13 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 stripe.api_key = STRIPE_SECRET_KEY or None
 
 PUBLIC_BASE = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-RETURN_BASE = (os.getenv("STRIPE_RETURN_BASE") or f"{PUBLIC_BASE}/pagamentos/stripe/sucesso").rstrip("/")
-CANCEL_BASE = (os.getenv("STRIPE_CANCEL_BASE") or f"{PUBLIC_BASE}/pagamentos/stripe/cancelado").rstrip("/")
+# Ajustamos as URLs de retorno e de cancelamento para apontarem para a raiz da
+# aplicação ao invés de depender de páginas estáticas na pasta `pagamentos`,
+# que foi removida do front‑end.  As variáveis de ambiente
+# STRIPE_RETURN_BASE e STRIPE_CANCEL_BASE continuam com prioridade caso
+# estejam definidas.
+RETURN_BASE = (os.getenv("STRIPE_RETURN_BASE") or f"{PUBLIC_BASE}/").rstrip("/")
+CANCEL_BASE = (os.getenv("STRIPE_CANCEL_BASE") or f"{PUBLIC_BASE}/").rstrip("/")
 NOTIFY_URL = (os.getenv("STRIPE_NOTIFY_URL") or f"{PUBLIC_BASE}/api/pay/stripe/webhook").rstrip("/")
 
 # Default plan price (for storing in our own database).  This is only used
