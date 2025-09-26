@@ -185,7 +185,8 @@ async def billing_status(user=Depends(get_current_user)) -> Dict[str, Any]:
 
 # Nota: As rotas de checkout e webhook da GetNet foram removidas.  Toda
 # cobrança agora é processada via Stripe.  Para iniciar um pagamento você
-# deve direcionar o usuário para ``/pagamentos/stripe`` no front‑end, que
-# chamará o endpoint ``/api/pay/stripe/checkout-url`` para obter a
-# sessão de Checkout.  O webhook do Stripe (``/api/pay/stripe/webhook``)
-# atualiza o status do pagamento e aplica créditos via ensure_tenant_active.
+# deve direcionar o usuário para a aba de *Pagamentos* no front‑end.
+# O front‑end utiliza a função `goToStripeCheckout` definida em ``app.js``
+# para chamar ``/api/pay/stripe/checkout-url`` e obter a sessão de Checkout.
+# O endpoint de webhook do Stripe (``/api/pay/stripe/webhook``) atualiza
+# o status do pagamento e aplica créditos via ``ensure_tenant_active``.
