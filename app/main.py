@@ -21,29 +21,14 @@ from .routes import (
 )
 from .routes import pay_stripe  # ✅ rotas de pagamento (Stripe)
 
-# -----------------------------------------------------------------------------
-# Autenticação da instância (UAZAPI)
-#
-# O backend expõe dois conjuntos de rotas de autenticação:
-#  - app/routes/users.py: login/registro de usuários (e-mail/senha) e conexão de
-#    instâncias à conta do usuário (/api/users/*).
-#  - app/auth.py: login da instância via token da UAZAPI, que retorna um JWT
-#    contendo apenas informações da instância (token, host etc.).
-#
-# No código original, as rotas de usuário eram registradas duas vezes: uma vez
-# em /api/users e, erroneamente, também em /api/auth. Isso fazia com que
-# /api/auth/login apontasse para o endpoint de login de usuário, exigindo
-# e-mail e senha. No front-end, a tela de “Conectar instância” chama
-# /api/auth/login com apenas o token da instância, mas o backend tratava esse
-# endpoint como login de usuário e retornava um erro reclamando de e‑mail/senha.
-#
-# Para corrigir isso, importamos o router correto de app/auth.py para a
-# montagem de /api/auth. Assim, /api/auth/login atenderá à rota de login da
-# instância, aceitando somente o token (e opcionalmente host/label). As
-# rotas de usuário continuam sob /api/users.
+# Auth da instância (UAZAPI): monta /api/auth corretamente a partir de app/auth.py
 from .auth import router as auth_router  # login via token da instância
-from .pg import init_schema
 
+# Schema inicial (seu módulo existente)
+from .pg import init_schema  # mantém como está, caso já crie outros schemas
+
+# 🔧 Billing schema (novo): garante que 'tenants' e 'payments' existam
+from .models_billing import init_billing_schema
 
 def allowed_origins() -> list[str]:
     allowlist = set()
@@ -73,7 +58,6 @@ def allowed_origin_regex() -> str | None:
 app = FastAPI(title="Luna Backend", version="1.0.0")
 
 # CORS — aceita lista e/ou regex
-# (mantém os dois domínios fixos e soma os do .env FRONTEND_ORIGINS)
 _default_origins = {
     "https://www.lunahia.com.br",
     "https://lunahia.com.br",  # opcional, sem www
@@ -107,10 +91,18 @@ async def _startup():
         logger.info("DATABASE_URL detectado (host/db: %s)", safe_db)
 
     try:
+        # Seu schema padrão (lead_status, users etc.)
         init_schema()
-        logger.info("Schemas verificados/criados com sucesso (lead_status/billing/users).")
+        logger.info("Schemas verificados/criados com sucesso (lead_status/users/afins).")
     except Exception:
-        logger.exception("Falha ao inicializar schema do banco.")
+        logger.exception("Falha ao inicializar schema do banco (módulo .pg).")
+
+    try:
+        # 🔧 Garante também o schema de billing (tenants/payments)
+        await init_billing_schema()
+        logger.info("Billing schema verificado/criado com sucesso (tenants/payments).")
+    except Exception:
+        logger.exception("Falha ao inicializar billing schema.")
 
 # ---------------------------- Rotas ------------------------------------ #
 # Auth de instância (UAZAPI)
