@@ -289,62 +289,78 @@ async def find_chats(
     _user=Depends(require_active_tenant_soft),   # <<< guard tolerante
     ctx=Depends(get_uazapi_ctx),
 ):
-    instance_id = _get_instance_id_from_request(request)
-    base, headers = _uaz(ctx)
-    url = f"{base}/chat/find"
+    """
+    Endpoint para retornar chats em formato JSON paginado.  Em caso de erro
+    inesperado (por exemplo, falha na comunicação com a UAZAPI), o erro é
+    encapsulado em uma resposta JSON e as credenciais CORS são aplicadas.
+    """
+    try:
+        instance_id = _get_instance_id_from_request(request)
+        base, headers = _uaz(ctx)
+        url = f"{base}/chat/find"
 
-    items: list[dict] = []
-    offset = 0
+        items: list[dict] = []
+        offset = 0
 
-    async with httpx.AsyncClient(timeout=30) as cli:
-        while len(items) < max_total:
-            payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
-            payload = {**payload, "limit": page_size, "offset": offset}
+        async with httpx.AsyncClient(timeout=30) as cli:
+            while len(items) < max_total:
+                payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+                payload = {**payload, "limit": page_size, "offset": offset}
 
-            r = await cli.post(url, json=payload, headers=headers)
-            if r.status_code >= 400:
-                raise HTTPException(status_code=r.status_code, detail=r.text)
+                r = await cli.post(url, json=payload, headers=headers)
+                if r.status_code >= 400:
+                    raise HTTPException(status_code=r.status_code, detail=r.text)
 
-            try:
-                data = r.json()
-            except Exception:
-                raise HTTPException(502, "Resposta inválida da UAZAPI em /chat/find")
-
-            chunk = _normalize_items(data)["items"]
-            if not chunk:
-                break
-
-            items.extend(chunk)
-            if len(chunk) < page_size:
-                break
-            offset += page_size
-
-    items = items[:max_total]
-
-    if classify and items:
-        async def worker(item: dict):
-            chatid = _pick_chatid(item)
-            if not chatid:
-                return
-            last_ts = _last_msg_ts_of(item)
-            st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
-            if st:
-                item["_stage"] = st
-                item["stage"] = st
                 try:
-                    crm_module.set_status_internal(chatid, st)
+                    data = r.json()
                 except Exception:
-                    pass
-            item["_last_ts"] = last_ts
+                    raise HTTPException(502, "Resposta inválida da UAZAPI em /chat/find")
 
-        await asyncio.gather(*(worker(it) for it in items))
-    else:
-        for it in items:
-            it["_last_ts"] = _last_msg_ts_of(it)
+                chunk = _normalize_items(data)["items"]
+                if not chunk:
+                    break
 
-    items.sort(key=lambda x: int(x.get("_last_ts") or 0), reverse=True)
+                items.extend(chunk)
+                if len(chunk) < page_size:
+                    break
+                offset += page_size
 
-    return {"items": items}
+        items = items[:max_total]
+
+        if classify and items:
+            async def worker(item: dict):
+                chatid = _pick_chatid(item)
+                if not chatid:
+                    return
+                last_ts = _last_msg_ts_of(item)
+                st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
+                if st:
+                    item["_stage"] = st
+                    item["stage"] = st
+                    try:
+                        crm_module.set_status_internal(chatid, st)
+                    except Exception:
+                        pass
+                item["_last_ts"] = last_ts
+
+            await asyncio.gather(*(worker(it) for it in items))
+        else:
+            for it in items:
+                it["_last_ts"] = _last_msg_ts_of(it)
+
+        items.sort(key=lambda x: int(x.get("_last_ts") or 0), reverse=True)
+
+        resp = JSONResponse({"items": items})
+        return _attach_cors_headers_to_response(request, resp)
+
+    except HTTPException as he:
+        # Erros HTTP são propagados com o código original, mas com CORS aplicado.
+        resp = JSONResponse({"error": he.detail}, status_code=he.status_code)
+        return _attach_cors_headers_to_response(request, resp)
+    except Exception as e:
+        # Erro inesperado (ex.: falha de comunicação com UAZAPI)
+        resp = JSONResponse({"error": f"find_chats_failed: {e}"}, status_code=500)
+        return _attach_cors_headers_to_response(request, resp)
 
 # ------------------ Stream NDJSON ------------------ #
 @router.post("/chats/stream")
@@ -356,76 +372,94 @@ async def stream_chats(
     _user=Depends(require_active_tenant_soft),   # <<< guard tolerante
     ctx=Depends(get_uazapi_ctx),
 ):
-    instance_id = _get_instance_id_from_request(request)
-    base, headers = _uaz(ctx)
-    url = f"{base}/chat/find"
+    """
+    Retorna um fluxo NDJSON de chats em ordem decrescente de timestamp.  Qualquer
+    falha inesperada é capturada e retornada como NDJSON ou JSON com
+    cabeçalhos CORS aplicados.
+    """
+    try:
+        instance_id = _get_instance_id_from_request(request)
+        base, headers = _uaz(ctx)
+        url = f"{base}/chat/find"
 
-    async def gen():
-        try:
-            count = 0
-            offset = 0
+        async def gen():
+            try:
+                count = 0
+                offset = 0
 
-            async with httpx.AsyncClient(timeout=30) as cli:
+                async with httpx.AsyncClient(timeout=30) as cli:
 
-                async def process_item(item: dict) -> Tuple[int, str]:
-                    chatid = _pick_chatid(item)
-                    last_ts = _last_msg_ts_of(item)
-                    if chatid:
-                        st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
-                        if st:
-                            item["_stage"] = st
-                            item["stage"] = st
-                            try:
-                                crm_module.set_status_internal(chatid, st)
-                            except Exception:
-                                pass
-                    item["_last_ts"] = last_ts
-                    return last_ts, json.dumps(item, ensure_ascii=False) + "\\n"
+                    async def process_item(item: dict) -> Tuple[int, str]:
+                        chatid = _pick_chatid(item)
+                        last_ts = _last_msg_ts_of(item)
+                        if chatid:
+                            st = await _maybe_classify_and_persist(instance_id, ctx, chatid, last_msg_ts=last_ts)
+                            if st:
+                                item["_stage"] = st
+                                item["stage"] = st
+                                try:
+                                    crm_module.set_status_internal(chatid, st)
+                                except Exception:
+                                    pass
+                        item["_last_ts"] = last_ts
+                        return last_ts, json.dumps(item, ensure_ascii=False) + "\n"
 
-                while count < max_total:
-                    payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
-                    payload = {**payload, "limit": page_size, "offset": offset}
+                    while count < max_total:
+                        payload = body if body else {"operator": "AND", "sort": "-wa_lastMsgTimestamp"}
+                        payload = {**payload, "limit": page_size, "offset": offset}
 
-                    r = await cli.post(url, json=payload, headers=headers)
-                    if r.status_code >= 400:
-                        yield json.dumps({"error": r.text}) + "\\n"
-                        return
-
-                    try:
-                        data = r.json()
-                    except Exception:
-                        yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\\n"
-                        return
-
-                    chunk = _normalize_items(data)["items"]
-                    if not chunk:
-                        break
-
-                    # processa em paralelo e mantém ordem por last_ts desc
-                    coros = [process_item(it) for it in chunk]
-                    results: list[Tuple[int, str]] = []
-                    for fut in asyncio.as_completed(coros):
                         try:
-                            results.append(await fut)
+                            r = await cli.post(url, json=payload, headers=headers)
                         except Exception as e:
-                            results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\\n"))
+                            # Erros de rede
+                            yield json.dumps({"error": f"uazapi_request_failed: {e}"}) + "\n"
+                            return
 
-                    for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
-                        yield line
-                        count += 1
-                        if count >= max_total:
+                        if r.status_code >= 400:
+                            yield json.dumps({"error": r.text}) + "\n"
+                            return
+
+                        try:
+                            data = r.json()
+                        except Exception:
+                            yield json.dumps({"error": "Resposta inválida da UAZAPI em /chat/find"}) + "\n"
+                            return
+
+                        chunk = _normalize_items(data)["items"]
+                        if not chunk:
                             break
 
-                    if len(chunk) < page_size or count >= max_total:
-                        break
-                    offset += page_size
-        except Exception as e:
-            # failsafe: nunca transforma em 500; retorna NDJSON de erro
-            yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\\n"
+                        coros = [process_item(it) for it in chunk]
+                        results: list[Tuple[int, str]] = []
+                        for fut in asyncio.as_completed(coros):
+                            try:
+                                results.append(await fut)
+                            except Exception as e:
+                                results.append((0, json.dumps({"error": f"process_item: {e}"}) + "\n"))
 
-    # Resposta do stream com cabeçalhos CORS aplicados
-    resp = StreamingResponse(gen(), media_type="application/x-ndjson")
-    return _attach_cors_headers_to_response(request, resp)
+                        for _ts, line in sorted(results, key=lambda x: x[0], reverse=True):
+                            yield line
+                            count += 1
+                            if count >= max_total:
+                                break
+
+                        if len(chunk) < page_size or count >= max_total:
+                            break
+                        offset += page_size
+            except Exception as e:
+                # failsafe: nunca transforma em 500; retorna NDJSON de erro
+                yield json.dumps({"error": f"stream-failed: {e.__class__.__name__}: {e}"}) + "\n"
+
+        resp = StreamingResponse(gen(), media_type="application/x-ndjson")
+        return _attach_cors_headers_to_response(request, resp)
+
+    except HTTPException as he:
+        # Retorna JSON com o código HTTP e aplica CORS
+        resp = JSONResponse({"error": he.detail}, status_code=he.status_code)
+        return _attach_cors_headers_to_response(request, resp)
+    except Exception as e:
+        resp = JSONResponse({"error": f"stream_chats_failed: {e}"}, status_code=500)
+        return _attach_cors_headers_to_response(request, resp)
 
 # ------------------ CORS Preflight explícito ------------------ #
 @router.options("/chats/stream", include_in_schema=False)
