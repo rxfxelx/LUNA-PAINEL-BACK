@@ -1,4 +1,4 @@
-# app/db/models_billing.py
+# app/models_billing.py
 from __future__ import annotations
 
 import os
