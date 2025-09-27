@@ -76,6 +76,17 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Sem credenciais")
     return _jwt_decode(tok)
 
+def get_current_account(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Valida JWT e garante que representa uma CONTA (tem email ou sub=user:<id>).
+    """
+    user = get_current_user(credentials)
+    email = str(user.get("email") or user.get("user_email") or "").strip().lower()
+    sub = str(user.get("sub") or "")
+    if email or sub.startswith("user:"):
+        return user
+    raise HTTPException(status_code=401, detail="account auth required")
+
 # --------- ROTAS ---------
 @router.post("/login", response_model=LoginOut)
 def login(body: LoginIn) -> LoginOut:
@@ -97,10 +108,7 @@ def login(body: LoginIn) -> LoginOut:
             detail="Host da UAZAPI ausente. Defina a env UAZAPI_HOST ou envie 'host' no login.",
         )
 
-    # normaliza host (sem protocolo / barras finais)
     host = host.replace("https://", "").replace("http://", "").strip("/")
-
-    # Se parecer um UUID, guardamos como instance_id
     instance_id: Optional[str] = raw_token if UUID_RE.match(raw_token) else None
 
     now = datetime.utcnow()
@@ -110,14 +118,13 @@ def login(body: LoginIn) -> LoginOut:
         "sub": "luna-user",
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
-        # usados pelas rotas/deps:
         "token": raw_token,
         "host": host,
-        # compat/extra:
         "instance_token": raw_token,
         "instance_id": instance_id,
         "label": (body.label or None),
         "number_hint": (body.number_hint or None),
+        "tok_kind": "instance",  # <-- marcador
     }
 
     tok = _jwt_encode(payload)
