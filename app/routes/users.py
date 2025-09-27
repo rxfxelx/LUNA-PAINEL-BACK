@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 import logging
 import os
@@ -17,7 +17,6 @@ from app.services.users import (
 
 # Tenta integrar com serviço de instâncias, se existir
 try:
-    # implemente esta função em app/services/instances.py:
     # def attach_instance_to_user(user_id: int, instance_token: str) -> dict: ...
     from app.services.instances import attach_instance_to_user  # type: ignore
 except Exception:  # pragma: no cover
@@ -30,8 +29,7 @@ log = logging.getLogger("uvicorn.error")
 JWT_SECRET = os.getenv("LUNA_JWT_SECRET") or os.getenv("JWT_SECRET") or "change-me"
 JWT_ALG = os.getenv("JWT_ALGORITHM", "HS256")
 
-# Se LUNA_JWT_TTL existir, tratamos como SEGUNDOS (como você usa 2592000=30d)
-# Caso contrário, caímos no USER_JWT_TTL_MIN (em minutos) e convertemos para segundos.
+# Se LUNA_JWT_TTL existir, tratamos como SEGUNDOS; senão, USER_JWT_TTL_MIN (minutos).
 if os.getenv("LUNA_JWT_TTL"):
     JWT_TTL_SECONDS = int(os.getenv("LUNA_JWT_TTL", "2592000"))
 else:
@@ -120,7 +118,7 @@ def register(body: RegisterIn):
 def login(body: LoginIn):
     try:
         u = get_user_by_email(body.email)
-        if not u or not verify_password(body.password, u["password_hash"]):
+        if not u or not verify_password(u.get("password_hash"), body.password):
             raise HTTPException(401, "Credenciais inválidas")
 
         touch_last_login(u["id"])
@@ -140,17 +138,11 @@ def login(body: LoginIn):
 def connect_instance(request: Request, body: InstanceConnectIn = Body(...)):
     """
     Conecta uma instância à conta do usuário autenticado.
-
-    Fluxo:
-    - Front envia Authorization: Bearer <jwt> (do /login).
-    - Body contém apenas {"token": "<token_da_instancia>"}.
-    - Backend descobre o email a partir do JWT e vincula a instância ao usuário.
     """
     # 1) Extrai e valida JWT, obtém e-mail
     payload = _jwt_payload_from_request(request)
     email = str(payload.get("email") or "").strip().lower()
     if not email:
-        # Nossa emissão sempre inclui 'email'; se não veio, algo está errado
         raise HTTPException(401, "JWT sem e-mail. Faça login novamente.")
 
     # 2) Busca usuário no banco
