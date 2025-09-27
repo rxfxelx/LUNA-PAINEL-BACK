@@ -11,13 +11,9 @@ from app.services.billing import (
     make_billing_key,
     ensure_trial,
     get_status,
-    mark_paid,
+    # mark_paid  # (não utilizado; mantido comentado para evitar linter/ImportError)
 )
-# The legacy GetNet integration has been removed, so there is no longer a
-# GetNetClient.  Billing now relies exclusively on Stripe (via the
-# pay_stripe routes) to handle subscription payments.  Keep the import
-# statement commented to avoid ImportError if lingering code references it.
-
+# A integração legada GetNet foi removida; cobrança agora ocorre apenas via Stripe.
 
 router = APIRouter()
 
@@ -77,42 +73,36 @@ def _billing_key_from_user(user: Dict[str, Any]) -> str:
     host = (user.get("host") or "").strip()
     iid = user.get("instance_id")
 
-    # Preferimos billing por instância quando token e host existem.  Isso
-    # mantém compatibilidade com a cobrança antiga baseada na UAZAPI.
+    # Preferimos billing por instância quando token e host existem (compat UAZAPI).
     if token and host:
         try:
             return make_billing_key(token, host, iid)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
 
-    # Caso não exista token/host, tratamos como JWT de usuário.  Tentamos
-    # extrair o id numérico do claim 'sub' (formato 'user:<id>').
+    # JWT de usuário: tenta 'sub' no formato 'user:<id>'.
     sub = str(user.get("sub") or "")
     if sub.startswith("user:"):
         uid = sub.split(":", 1)[1]
         if uid:
             return f"uid:{uid}"
 
-    # Como fallback, usamos o e‑mail.  Quando há e‑mail disponível, geramos um
-    # digest HMAC‐SHA256 com o BILLING_SALT para não armazenar o endereço
-    # original como chave.  Isso garante unicidade e evita vazamento de PII.
+    # Fallback: usa e-mail com HMAC-SHA256 (BILLING_SALT) para não expor PII.
     email = (user.get("email") or user.get("user_email") or "").strip().lower()
     if email:
         import hashlib
         import hmac
-        import os
+
         salt = (os.getenv("BILLING_SALT") or "luna").encode()
         digest = hmac.new(salt, email.encode(), hashlib.sha256).hexdigest()
         return f"ue:{digest}"
 
-    # Se não conseguimos extrair nenhuma informação, negamos a solicitação.
+    # Sem dados suficientes.
     raise HTTPException(status_code=401, detail="JWT inválido: sem token/host/email/sub")
 
 
 def _safe_get_status(bkey: str) -> Dict[str, Any]:
-    """
-    Lê o status do billing sem deixar a rota explodir em 500.
-    """
+    """Lê o status do billing sem deixar a rota explodir em 500."""
     try:
         return get_status(bkey)
     except Exception as e:
@@ -121,7 +111,7 @@ def _safe_get_status(bkey: str) -> Dict[str, Any]:
 
 # ------------------------ modelos ------------------------
 class CheckoutLinkIn(BaseModel):
-    return_url: Optional[str] = None  # URL para redirecionar após pagamento (opcional)
+    return_url: Optional[str] = None  # (sem uso direto aqui; mantido para compat.)
 
 
 class WebhookIn(BaseModel):
@@ -181,12 +171,4 @@ async def billing_status(user=Depends(get_current_user)) -> Dict[str, Any]:
     st = _safe_get_status(bkey)
     return {"ok": True, "billing_key": bkey, "status": st}
 
-
-
-# Nota: As rotas de checkout e webhook da GetNet foram removidas.  Toda
-# cobrança agora é processada via Stripe.  Para iniciar um pagamento você
-# deve direcionar o usuário para a aba de *Pagamentos* no front‑end.
-# O front‑end utiliza a função `goToStripeCheckout` definida em ``app.js``
-# para chamar ``/api/pay/stripe/checkout-url`` e obter a sessão de Checkout.
-# O endpoint de webhook do Stripe (``/api/pay/stripe/webhook``) atualiza
-# o status do pagamento e aplica créditos via ``ensure_tenant_active``.
+# Observação: cobranca via Stripe → ver routes/pay_stripe.py
