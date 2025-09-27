@@ -1,14 +1,6 @@
 """
 Stripe payment integration routes for Luna.
 
-This module implements a minimal integration with Stripe Checkout for
-recurring subscription payments. Instead of interacting directly with
-credit card data (as the previous GetNet integration did), Stripe
-provides a hosted checkout page. Your backend only needs to create a
-Checkout Session and redirect the user to the ``session.url``. When
-payments succeed or fail, Stripe sends webhook events that we use to
-update our own billing records.
-
 Flow (resumo):
 1) Criar sessão via /checkout (ou /checkout-url) e redirecionar para `session.url`.
 2) Stripe chama /webhook com eventos (ex.: invoice.paid, invoice.payment_failed).
@@ -21,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import stripe  # type: ignore
 from fastapi import APIRouter, HTTPException, Request
@@ -34,26 +26,10 @@ from app.models_billing import (
     set_tenant_inactive,
 )
 
-# Initialise the router
 router = APIRouter()
 
 # -----------------------------------------------------------------------------
 # Stripe configuration
-#
-# Env vars esperadas:
-#   STRIPE_SECRET_KEY      – secret key da Stripe (obrigatório)
-#   STRIPE_PRICE_ID        – price (recorrente) do plano no Stripe (obrigatório)
-#   STRIPE_WEBHOOK_SECRET  – secret para validar a assinatura do webhook (opcional em dev)
-#   PUBLIC_BASE_URL        – base pública do front (para compor success/cancel)
-#   STRIPE_RETURN_BASE     – (opcional) override do success
-#   STRIPE_CANCEL_BASE     – (opcional) override do cancel
-#   STRIPE_NOTIFY_URL      – (opcional) URL pública do webhook (apenas informativa; não usada no código)
-#   LUNA_PRICE_CENTS       – valor em centavos usado no registro local (não afeta Stripe)
-#
-# Observação: o endpoint público REAL do webhook é o do backend:
-#   .../api/pay/stripe/webhook
-# Configure isso no Dashboard da Stripe apontando para o domínio público do backend.
-
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -64,7 +40,7 @@ PUBLIC_BASE = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 # Retornos apontam para a RAIZ do site (páginas estáticas /pagamentos foram removidas).
 RETURN_BASE = (os.getenv("STRIPE_RETURN_BASE") or f"{PUBLIC_BASE}/").rstrip("/")
 CANCEL_BASE = (os.getenv("STRIPE_CANCEL_BASE") or f"{PUBLIC_BASE}/").rstrip("/")
-# Apenas referência para você configurar na Stripe; não é usado diretamente abaixo.
+# Apenas referência para configuração no dashboard (não usado diretamente abaixo).
 NOTIFY_URL = (os.getenv("STRIPE_NOTIFY_URL") or f"{PUBLIC_BASE}/api/pay/stripe/webhook").rstrip("/")
 
 DEFAULT_PRICE_CENTS = int(os.getenv("LUNA_PRICE_CENTS") or 34990)
@@ -74,11 +50,6 @@ DEFAULT_PRICE_CENTS = int(os.getenv("LUNA_PRICE_CENTS") or 34990)
 class CheckoutIn(BaseModel):
     """
     Input payload for creating a checkout session.
-
-    email – e‑mail do cliente (prefill e vínculo da assinatura).
-    plan – identificador interno do plano (vai nas metadatas).
-    amount_cents – valor usado apenas no registro local (Stripe cobra pelo PRICE).
-    tenant_key – chave do tenant na nossa base; se não vier, usamos o e‑mail.
     """
     email: EmailStr
     plan: str = Field(default="luna_base")
@@ -89,9 +60,6 @@ class CheckoutIn(BaseModel):
 class CheckoutOut(BaseModel):
     """
     Response for checkout creation.
-
-    ref – referência interna do pagamento.
-    url – URL hosted do Stripe para redirecionar o cliente.
     """
     ref: str
     url: str
@@ -99,12 +67,41 @@ class CheckoutOut(BaseModel):
 
 # ---------------------------- Helper functions -------------------------------
 def _build_success_url(ref: str) -> str:
-    return f"{RETURN_BASE}?ref={ref}"
+    base = RETURN_BASE or ""
+    return f"{base}?ref={ref}" if base else f"?ref={ref}"
 
 
 def _build_cancel_url(ref: str) -> str:
-    return f"{CANCEL_BASE}?ref={ref}"
+    base = CANCEL_BASE or ""
+    return f"{base}?ref={ref}" if base else f"?ref={ref}"
 
+
+def _extract_event_parts(event: Any) -> Tuple[str, Dict[str, Any]]:
+    """
+    Extrai (event_type, data_object) de um dict ou stripe.Event.
+    Garante que sempre retornaremos estruturas nativas (dict).
+    """
+    # Caso 1: payload já em dict (sem validação de assinatura)
+    if isinstance(event, dict):
+        etype = event.get("type", "")
+        data_obj = (event.get("data") or {}).get("object") or {}
+        return etype, data_obj if isinstance(data_obj, dict) else {}
+
+    # Caso 2: stripe.Event / StripeObject
+    try:
+        etype = getattr(event, "type", "") or event["type"]
+    except Exception:
+        etype = ""
+
+    try:
+        data = getattr(event, "data", None) or event["data"]
+        obj = getattr(data, "object", None) or data["object"]
+        # StripeObject -> dict
+        if hasattr(obj, "to_dict"):
+            obj = obj.to_dict()  # type: ignore
+        return etype, obj if isinstance(obj, dict) else {}
+    except Exception:
+        return etype, {}
 
 # ---------------------------- Checkout endpoints -----------------------------
 @router.post("/checkout", response_model=CheckoutOut)
@@ -209,19 +206,16 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
     # Com secret -> valida assinatura; sem secret (homolog/dev) -> parse JSON simples
     if STRIPE_WEBHOOK_SECRET:
         try:
-            # `payload` é bytes; a SDK aceita bytes aqui
             event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Webhook signature verification failed: {e}")
     else:
         try:
-            # Em dev, quando não há secret, precisamos decodificar bytes -> str
             event = json.loads(payload.decode("utf-8"))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
 
-    event_type = event.get("type")
-    data_object = event.get("data", {}).get("object", {})  # invoice/subscription/etc.
+    event_type, data_object = _extract_event_parts(event)
 
     # ---------------- invoice.paid ----------------
     if event_type == "invoice.paid":
@@ -229,14 +223,17 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
-                meta = sub.metadata or {}
+                meta = getattr(sub, "metadata", None) or {}
+                # StripeObject → dict
+                if hasattr(meta, "to_dict"):
+                    meta = meta.to_dict()  # type: ignore
                 ref = meta.get("reference_id")
                 tenant_key = meta.get("tenant_key") or ref
                 plan = meta.get("plan", "luna_base")
                 email = meta.get("email")
                 if ref:
                     try:
-                        await update_payment_status(ref, "paid", raw=event)
+                        await update_payment_status(ref, "paid", raw={"type": event_type, "object": data_object})
                     except Exception:
                         pass
                     try:
@@ -259,11 +256,13 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
-                meta = sub.metadata or {}
+                meta = getattr(sub, "metadata", None) or {}
+                if hasattr(meta, "to_dict"):
+                    meta = meta.to_dict()  # type: ignore
                 ref = meta.get("reference_id")
                 if ref:
                     try:
-                        await update_payment_status(ref, "failed", raw=event)
+                        await update_payment_status(ref, "failed", raw={"type": event_type, "object": data_object})
                     except Exception:
                         pass
             except Exception:
@@ -276,7 +275,7 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
         tenant_key = meta.get("tenant_key")
         if ref:
             try:
-                await update_payment_status(ref, "failed", raw=event)
+                await update_payment_status(ref, "failed", raw={"type": event_type, "object": data_object})
             except Exception:
                 pass
         if tenant_key:
