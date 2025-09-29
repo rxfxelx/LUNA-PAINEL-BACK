@@ -118,7 +118,8 @@ def register(body: RegisterIn):
 def login(body: LoginIn):
     try:
         u = get_user_by_email(body.email)
-        if not u or not verify_password(u.get("password_hash"), body.password):
+        # >>> Correção: verify_password(plain, hashed)
+        if not u or not verify_password(body.password, u.get("password_hash") or ""):
             raise HTTPException(401, "Credenciais inválidas")
 
         touch_last_login(u["id"])
