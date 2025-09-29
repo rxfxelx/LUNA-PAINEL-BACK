@@ -1,3 +1,4 @@
+# app/routes/billing.py
 from __future__ import annotations
 
 import os
@@ -80,7 +81,7 @@ def _billing_key_from_user(user: Dict[str, Any]) -> str:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
 
-    # JWT de usuário: tenta 'sub' no formato 'user:<id>'.
+    # JWT de usuário: tenta 'sub' no formato 'user:'
     sub = str(user.get("sub") or "")
     if sub.startswith("user:"):
         uid = sub.split(":", 1)[1]
