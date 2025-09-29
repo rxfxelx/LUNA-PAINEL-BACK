@@ -1,3 +1,4 @@
+# deps_billing.py
 from __future__ import annotations
 
 import os
@@ -155,8 +156,6 @@ async def require_active_tenant_soft(
         return await require_active_tenant(user)
     except HTTPException as e:
         if e.status_code in (401, 402, 403):
-            # Importante: repropagar para que o FastAPI devolva o JSON (com CORS).
-            # O `detail` já está jsonable_encoder, então não quebra serialização.
             raise
         return None
     except Exception:
