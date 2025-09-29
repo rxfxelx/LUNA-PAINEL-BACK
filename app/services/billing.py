@@ -200,3 +200,34 @@ def mark_paid(
                 """,
                 (new_paid, plan, status, billing_key),
             )
+
+
+def mark_status(
+    billing_key: str,
+    status: str,
+    plan: Optional[str] = None,
+) -> None:
+    """
+    Atualiza apenas o last_payment_status (e opcionalmente o plan), sem mexer no paid_until.
+    Útil para refletir 'failed', 'canceled' etc. em /billing/status.
+    """
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # garante existência do registro (idempotente)
+            cur.execute(
+                """
+                INSERT INTO billing_accounts (billing_key, created_at, trial_started_at, trial_ends_at)
+                VALUES (%s, NOW(), NOW(), %s)
+                ON CONFLICT (billing_key) DO NOTHING
+                """,
+                (billing_key, _utcnow() + timedelta(days=TRIAL_DAYS)),
+            )
+            cur.execute(
+                """
+                UPDATE billing_accounts
+                   SET last_payment_status = %s,
+                       plan = COALESCE(%s, plan)
+                 WHERE billing_key = %s
+                """,
+                (status, plan, billing_key),
+            )
