@@ -1,3 +1,4 @@
+# app/routes/pay_stripe.py
 """
 Stripe payment integration routes for Luna.
 
@@ -116,6 +117,7 @@ async def create_checkout(body: CheckoutIn) -> CheckoutOut:
 
     # Referência interna
     ref = f"st_{uuid.uuid4().hex}"
+    # ⚠️ IMPORTANTÍSSIMO: o tenant_key que sai do front precisa ser o mesmo billing_key
     tenant_key = body.tenant_key or str(body.email)
 
     # 1) cria/atualiza registro local "pending" (não bloqueia o fluxo)
@@ -230,7 +232,7 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                 if hasattr(meta, "to_dict"):
                     meta = meta.to_dict()  # type: ignore
                 ref = meta.get("reference_id")
-                tenant_key = meta.get("tenant_key") or ref  # <- aqui esperamos o billing_key
+                tenant_key = meta.get("tenant_key") or None  # billing_key esperado aqui
                 plan = meta.get("plan", "luna_base")
                 email = meta.get("email")
                 if ref:
@@ -241,7 +243,7 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                 # 1) Ativa tenant (operacional) por 1 mês
                 try:
                     await ensure_tenant_active(
-                        tenant_key=tenant_key,
+                        tenant_key=tenant_key or ref or "",
                         email=email,
                         plan=plan,
                         months=1,
@@ -249,7 +251,6 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                 except Exception:
                     pass
                 # 2) >>> NOVO: reflete no billing_accounts (UI /billing/status)
-                #    Avança/define paid_until + atualiza plan/last_payment_status
                 try:
                     if tenant_key:
                         # tenant_key aqui é o billing_key enviado no checkout
