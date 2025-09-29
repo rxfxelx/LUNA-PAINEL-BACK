@@ -25,6 +25,8 @@ from app.models_billing import (
     ensure_tenant_active,
     set_tenant_inactive,
 )
+# >>> NOVO: persistir período pago/estado no billing_accounts (refletir no /billing/status)
+from app.services.billing import mark_paid, mark_status  # mark_status cobre "failed" etc.
 
 router = APIRouter()
 
@@ -228,7 +230,7 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                 if hasattr(meta, "to_dict"):
                     meta = meta.to_dict()  # type: ignore
                 ref = meta.get("reference_id")
-                tenant_key = meta.get("tenant_key") or ref
+                tenant_key = meta.get("tenant_key") or ref  # <- aqui esperamos o billing_key
                 plan = meta.get("plan", "luna_base")
                 email = meta.get("email")
                 if ref:
@@ -236,16 +238,24 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                         await update_payment_status(ref, "paid", raw={"type": event_type, "object": data_object})
                     except Exception:
                         pass
-                    try:
-                        # Ativa por 1 mês — o ciclo seguinte será cobrado pela Stripe
-                        await ensure_tenant_active(
-                            tenant_key=tenant_key,
-                            email=email,
-                            plan=plan,
-                            months=1,
-                        )
-                    except Exception:
-                        pass
+                # 1) Ativa tenant (operacional) por 1 mês
+                try:
+                    await ensure_tenant_active(
+                        tenant_key=tenant_key,
+                        email=email,
+                        plan=plan,
+                        months=1,
+                    )
+                except Exception:
+                    pass
+                # 2) >>> NOVO: reflete no billing_accounts (UI /billing/status)
+                #    Avança/define paid_until + atualiza plan/last_payment_status
+                try:
+                    if tenant_key:
+                        # tenant_key aqui é o billing_key enviado no checkout
+                        mark_paid(billing_key=str(tenant_key), days=30, plan=plan, status="paid")
+                except Exception:
+                    pass
             except Exception:
                 # Não quebra o webhook; Stripe só precisa de 2xx
                 pass
@@ -260,11 +270,19 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
                 if hasattr(meta, "to_dict"):
                     meta = meta.to_dict()  # type: ignore
                 ref = meta.get("reference_id")
+                tenant_key = meta.get("tenant_key")  # billing_key
+                plan = meta.get("plan")
                 if ref:
                     try:
                         await update_payment_status(ref, "failed", raw={"type": event_type, "object": data_object})
                     except Exception:
                         pass
+                # >>> NOVO: anota status "failed" no billing_accounts (não mexe no paid_until)
+                try:
+                    if tenant_key:
+                        mark_status(billing_key=str(tenant_key), status="failed", plan=plan)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -272,12 +290,20 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
     elif event_type == "customer.subscription.deleted":
         meta = data_object.get("metadata", {}) or {}
         ref = meta.get("reference_id")
-        tenant_key = meta.get("tenant_key")
+        tenant_key = meta.get("tenant_key")  # billing_key
+        plan = meta.get("plan")
         if ref:
             try:
                 await update_payment_status(ref, "failed", raw={"type": event_type, "object": data_object})
             except Exception:
                 pass
+        # >>> NOVO: refletir "failed" também no billing_accounts
+        try:
+            if tenant_key:
+                mark_status(billing_key=str(tenant_key), status="failed", plan=plan)
+        except Exception:
+            pass
+        # E desativar tenant operacional
         if tenant_key:
             try:
                 await set_tenant_inactive(tenant_key)
