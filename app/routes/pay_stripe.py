@@ -199,10 +199,26 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
     """
     Webhook da Stripe.
 
-    - invoice.paid: marca pagamento como "paid" e ativa o tenant por 1 mês.
-    - invoice.payment_failed: marca pagamento como "failed".
-    - customer.subscription.deleted: marca "failed" e desativa o tenant.
+    Este endpoint processa eventos enviados pelo Stripe e sincroniza o status de
+    pagamentos/assinaturas com o banco de dados interno.  A lógica abaixo cobre
+    tanto pagamentos de faturas (``invoice.paid``) quanto a conclusão do
+    checkout de assinatura (``checkout.session.completed``) e falhas ou
+    cancelamentos.
+
+    * ``invoice.paid``: marca o pagamento como "paid", ativa o tenant por 1 mês
+      e estende o período de pagamento no ``billing_accounts`` por 30 dias.
+    * ``invoice.payment_failed``: marca o pagamento como "failed" e atualiza o
+      ``billing_accounts`` com ``last_payment_status='failed'``.
+    * ``customer.subscription.deleted``: marca "failed", atualiza
+      ``billing_accounts`` e desativa o tenant.
+    * ``checkout.session.completed``: quando o usuário finaliza o checkout em
+      modo assinatura, alguns fluxos (especialmente pagamentos fora do fluxo de
+      fatura) não disparam imediatamente ``invoice.paid``.  Para garantir que
+      o sistema reconheça o pagamento logo após o checkout, processamos este
+      evento como sinônimo de sucesso, extraindo a metadata e executando as
+      mesmas ações de um ``invoice.paid``.
     """
+
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
     event: Any
@@ -221,95 +237,136 @@ async def stripe_webhook(request: Request) -> Dict[str, Any]:
 
     event_type, data_object = _extract_event_parts(event)
 
-    # ---------------- invoice.paid ----------------
+    async def _process_success(meta: Dict[str, Any], raw_obj: Dict[str, Any], etype: str) -> None:
+        """Processa o sucesso de pagamento ou checkout.
+
+        Esta função marca o pagamento como "paid" (se houver uma referência),
+        ativa o tenant por 1 mês e atualiza o ``billing_accounts`` com os dias
+        pagos.  Todas as exceções são capturadas para evitar que o webhook
+        retorne erro ao Stripe.
+        """
+        ref = meta.get("reference_id")
+        tenant_key = meta.get("tenant_key") or None
+        plan = meta.get("plan", "luna_base")
+        email = meta.get("email")
+
+        # Atualiza o status do pagamento (tabela payments)
+        if ref:
+            try:
+                await update_payment_status(ref, "paid", raw={"type": etype, "object": raw_obj})
+            except Exception:
+                pass
+
+        # Ativa o tenant (tabela tenants) por 1 mês
+        if tenant_key:
+            try:
+                await ensure_tenant_active(
+                    tenant_key=tenant_key or ref or "",
+                    email=email,
+                    plan=plan,
+                    months=1,
+                )
+            except Exception:
+                pass
+
+            # Atualiza billing_accounts (tabela interna de billing) com o novo período
+            try:
+                mark_paid(billing_key=str(tenant_key), days=30, plan=plan, status="paid")
+            except Exception:
+                pass
+
+    # -------------------- invoice.paid --------------------
     if event_type == "invoice.paid":
         subscription_id = data_object.get("subscription")
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
-                meta = getattr(sub, "metadata", None) or {}
+                meta: Dict[str, Any] = getattr(sub, "metadata", None) or {}
                 # StripeObject → dict
                 if hasattr(meta, "to_dict"):
                     meta = meta.to_dict()  # type: ignore
-                ref = meta.get("reference_id")
-                tenant_key = meta.get("tenant_key") or None  # billing_key esperado aqui
-                plan = meta.get("plan", "luna_base")
-                email = meta.get("email")
-                if ref:
-                    try:
-                        await update_payment_status(ref, "paid", raw={"type": event_type, "object": data_object})
-                    except Exception:
-                        pass
-                # 1) Ativa tenant (operacional) por 1 mês
-                try:
-                    await ensure_tenant_active(
-                        tenant_key=tenant_key or ref or "",
-                        email=email,
-                        plan=plan,
-                        months=1,
-                    )
-                except Exception:
-                    pass
-                # 2) >>> NOVO: reflete no billing_accounts (UI /billing/status)
-                try:
-                    if tenant_key:
-                        # tenant_key aqui é o billing_key enviado no checkout
-                        mark_paid(billing_key=str(tenant_key), days=30, plan=plan, status="paid")
-                except Exception:
-                    pass
+                await _process_success(meta, data_object, event_type)
             except Exception:
                 # Não quebra o webhook; Stripe só precisa de 2xx
                 pass
 
-    # ---------------- invoice.payment_failed ----------------
+    # -------------------- invoice.payment_failed --------------------
     elif event_type == "invoice.payment_failed":
         subscription_id = data_object.get("subscription")
         if subscription_id:
             try:
                 sub = stripe.Subscription.retrieve(subscription_id)
-                meta = getattr(sub, "metadata", None) or {}
+                meta: Dict[str, Any] = getattr(sub, "metadata", None) or {}
                 if hasattr(meta, "to_dict"):
                     meta = meta.to_dict()  # type: ignore
                 ref = meta.get("reference_id")
-                tenant_key = meta.get("tenant_key")  # billing_key
+                tenant_key = meta.get("tenant_key")
                 plan = meta.get("plan")
+                # Atualiza payment para failed
                 if ref:
                     try:
                         await update_payment_status(ref, "failed", raw={"type": event_type, "object": data_object})
                     except Exception:
                         pass
-                # >>> NOVO: anota status "failed" no billing_accounts (não mexe no paid_until)
-                try:
-                    if tenant_key:
+                # Marca status de falha no billing_accounts
+                if tenant_key:
+                    try:
                         mark_status(billing_key=str(tenant_key), status="failed", plan=plan)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-    # ---------------- customer.subscription.deleted ----------------
+    # -------------------- customer.subscription.deleted --------------------
     elif event_type == "customer.subscription.deleted":
-        meta = data_object.get("metadata", {}) or {}
+        # Para cancelamentos e remoções de assinatura, a metadata fica
+        # diretamente em data_object.metadata
+        meta: Dict[str, Any] = data_object.get("metadata", {}) or {}
         ref = meta.get("reference_id")
-        tenant_key = meta.get("tenant_key")  # billing_key
+        tenant_key = meta.get("tenant_key")
         plan = meta.get("plan")
+        # Atualiza payment para failed
         if ref:
             try:
                 await update_payment_status(ref, "failed", raw={"type": event_type, "object": data_object})
             except Exception:
                 pass
-        # >>> NOVO: refletir "failed" também no billing_accounts
-        try:
-            if tenant_key:
-                mark_status(billing_key=str(tenant_key), status="failed", plan=plan)
-        except Exception:
-            pass
-        # E desativar tenant operacional
+        # Marca status de falha no billing_accounts
         if tenant_key:
+            try:
+                mark_status(billing_key=str(tenant_key), status="failed", plan=plan)
+            except Exception:
+                pass
+            # Desativa o tenant operacional
             try:
                 await set_tenant_inactive(tenant_key)
             except Exception:
                 pass
 
-    # Stripe espera apenas um 2xx para considerar entregue
+    # -------------------- checkout.session.completed --------------------
+    elif event_type == "checkout.session.completed":
+        # Sessão concluída: usa metadata da sessão ou busca a assinatura
+        meta: Dict[str, Any] = data_object.get("metadata", {}) or {}
+        # Alguns eventos incluem subscription no objeto
+        subscription_id = data_object.get("subscription") or data_object.get("subscription_id")
+        # Se a metadata estiver vazia e houver subscription, tenta extrair da assinatura
+        if (not meta or not meta.get("reference_id")) and subscription_id:
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                meta_sub: Dict[str, Any] = getattr(sub, "metadata", None) or {}
+                if hasattr(meta_sub, "to_dict"):
+                    meta_sub = meta_sub.to_dict()  # type: ignore
+                # Prioriza metadata da assinatura caso exista
+                meta = {**meta, **meta_sub}
+            except Exception:
+                pass
+        # Se ainda não houver reference_id, tenta usar client_reference_id
+        if not meta.get("reference_id"):
+            ref = data_object.get("client_reference_id")
+            if ref:
+                meta["reference_id"] = ref
+        # Processa como sucesso
+        await _process_success(meta, data_object, event_type)
+
+    # Retorna sucesso genérico (Stripe precisa apenas de 2xx)
     return {"ok": True}
