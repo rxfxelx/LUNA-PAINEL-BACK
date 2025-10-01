@@ -1,175 +1,278 @@
-# app/routes/billing.py
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from app.pg import get_pool  # usa o pool do psycopg_pool
 
-from app.auth import get_current_user
-from app.services.billing import (
-    make_billing_key,
-    ensure_trial,
-    get_status,
-    # mark_paid  # (não utilizado; mantido comentado para evitar linter/ImportError)
-)
-# A integração legada GetNet foi removida; cobrança agora ocorre apenas via Stripe.
-
-router = APIRouter()
+# Número de dias do período de testes gratuito.  Ajustado para 14 dias por padrão.
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS") or 14)
+_SALT = (os.getenv("BILLING_SALT") or "luna").encode()
 
 
-# ------------------------ helpers ------------------------
-def _env_list(name: str) -> list[str]:
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return []
-    return [x.strip() for x in raw.split(",") if x.strip()]
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _is_admin_bypass(user: Dict[str, Any]) -> bool:
+# -------------------------------------------------------------------
+# CANONICALIZAÇÃO DE CHAVE (sempre por INSTÂNCIA)
+# -------------------------------------------------------------------
+def canonical_instance_key(key_or_token: str) -> str:
     """
-    Bypass para contas administradoras. Ativa caso QUALQUER uma das listas case:
-      - ADMIN_BYPASS_EMAILS  (com base em user['email'] ou user['user_email'])
-      - ADMIN_BYPASS_HOSTS   (com base em user['host'])
-      - ADMIN_BYPASS_TOKENS  (com base em user['token'] ou user['instance_token'])
+    Normaliza qualquer identificador de instância para o formato:
+      iid:<valor>
+    - Se já vier com prefixo iid:, mantém.
+    - Caso contrário, pré-fixa iid: ao token/id informado.
     """
-    emails = set(x.lower() for x in _env_list("ADMIN_BYPASS_EMAILS"))
-    hosts = set(_env_list("ADMIN_BYPASS_HOSTS"))
-    toks = set(_env_list("ADMIN_BYPASS_TOKENS"))
-
-    email = (user.get("email") or user.get("user_email") or "").lower().strip()
-    host = (user.get("host") or "").strip()
-    token = (user.get("token") or user.get("instance_token") or "").strip()
-
-    if email and email in emails:
-        return True
-    if host and host in hosts:
-        return True
-    if token and token in toks:
-        return True
-    return False
+    s = (key_or_token or "").strip()
+    return s if s.startswith("iid:") else f"iid:{s}"
 
 
-def _billing_key_from_user(user: Dict[str, Any]) -> str:
+def make_billing_key(token: str, host: str, instance_id: Optional[str]) -> str:
     """
-    Monta um ``billing_key`` a partir do JWT do usuário.  Este helper suporta
-    tanto tokens de instância (quando ``token`` e ``host`` estão presentes no
-    payload) quanto tokens de usuário (quando ``sub`` inicia com ``user:`` ou
-    quando existe um ``email`` válido).  Para tokens de instância o
-    comportamento original é preservado, utilizando :func:`make_billing_key`.
-
-    Para tokens de usuário, o ``billing_key`` segue um dos formatos abaixo:
-
-    * ``uid:<id>`` – quando o claim ``sub`` possui o prefixo ``user:`` e
-      conseguirmos extrair o identificador numérico.
-    * ``ue:<hash>`` – quando apenas o e‑mail está disponível.  O hash é
-      calculado com HMAC-SHA256 a partir do e‑mail e do ``BILLING_SALT`` para
-      evitar expor diretamente o endereço.
-
-    Caso nenhum dado suficiente esteja presente no JWT, a função aborta com
-    ``HTTP 401``.
+    Preferimos billing por INSTÂNCIA:
+      - Se houver instance_id (UUID), usa:   iid:<instance_id>
+      - Senão, se houver token, usa:         iid:<token>
+      - Fallback legado (raríssimo): hash de host|token (ht:<sha256>)
     """
-    token = (user.get("token") or user.get("instance_token") or "").strip()
-    host = (user.get("host") or "").strip()
-    iid = user.get("instance_id")
+    if instance_id:
+        return canonical_instance_key(instance_id)
+    if token:
+        return canonical_instance_key(token)
 
-    # Preferimos billing por instância quando token e host existem (compat UAZAPI).
-    if token and host:
-        try:
-            return make_billing_key(token, host, iid)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro ao gerar billing_key: {e}")
-
-    # JWT de usuário: tenta 'sub' no formato 'user:'
-    sub = str(user.get("sub") or "")
-    if sub.startswith("user:"):
-        uid = sub.split(":", 1)[1]
-        if uid:
-            return f"uid:{uid}"
-
-    # Fallback: usa e-mail com HMAC-SHA256 (BILLING_SALT) para não expor PII.
-    email = (user.get("email") or user.get("user_email") or "").strip().lower()
-    if email:
-        import hashlib
-        import hmac
-
-        salt = (os.getenv("BILLING_SALT") or "luna").encode()
-        digest = hmac.new(salt, email.encode(), hashlib.sha256).hexdigest()
-        return f"ue:{digest}"
-
-    # Sem dados suficientes.
-    raise HTTPException(status_code=401, detail="JWT inválido: sem token/host/email/sub")
+    # Fallback ultra-conservador (evitar None/None)
+    raw = f"{host}|{token}".encode()
+    digest = hmac.new(_SALT, raw, hashlib.sha256).hexdigest()
+    return f"ht:{digest}"
 
 
-def _safe_get_status(bkey: str) -> Dict[str, Any]:
-    """Lê o status do billing sem deixar a rota explodir em 500."""
-    try:
-        return get_status(bkey)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Billing indisponível: {e}")
-
-
-# ------------------------ modelos ------------------------
-class CheckoutLinkIn(BaseModel):
-    return_url: Optional[str] = None  # (sem uso direto aqui; mantido para compat.)
-
-
-class WebhookIn(BaseModel):
-    ref: str                         # billing_key enviado como reference/order_id
-    status: str = "paid"             # 'paid', 'approved', 'refused', etc.
-    days: int = 30                   # dias para estender o paid_until
-    plan: Optional[str] = "mensal-34990"
-
-
-# ------------------------ rotas ------------------------
-@router.post("/register-trial")
-async def register_trial(user=Depends(get_current_user)) -> Dict[str, Any]:
+# -------------------------------------------------------------------
+# OPERACOES DE TRIAL / STATUS / ATUALIZACOES
+# -------------------------------------------------------------------
+def ensure_trial(billing_key: str) -> Dict[str, Any]:
     """
-    Garante o registro do tenant e inicia o trial se não existir.
-    Admin (bypass): sempre ativo sem tocar no billing.
+    Garante que exista um registro e que o trial esteja iniciado (idempotente).
+    Retorna um snapshot básico do registro.
     """
-    if _is_admin_bypass(user):
+    bkey = canonical_instance_key(billing_key)
+    trial_ends = _utcnow() + timedelta(days=TRIAL_DAYS)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # UPSERT idempotente
+            cur.execute(
+                """
+                INSERT INTO billing_accounts
+                    (billing_key, created_at, trial_started_at, trial_ends_at)
+                VALUES
+                    (%s, NOW(), NOW(), %s)
+                ON CONFLICT (billing_key) DO NOTHING
+                """,
+                (bkey, trial_ends),
+            )
+
+            # Lê o registro atualizado
+            cur.execute(
+                """
+                SELECT trial_started_at, trial_ends_at, paid_until, plan, last_payment_status
+                  FROM billing_accounts
+                 WHERE billing_key = %s
+                """,
+                (bkey,),
+            )
+            row = cur.fetchone()
+
+    if not row:
         return {
-            "ok": True,
-            "billing_key": None,
-            "status": {"active": True, "plan": "admin", "admin_bypass": True},
+            "trial_started_at": None,
+            "trial_ends_at": None,
+            "paid_until": None,
+            "plan": None,
+            "last_payment_status": None,
         }
 
-    bkey = _billing_key_from_user(user)
-
-    # tenta ler status; se não existir, cria trial
-    try:
-        st = get_status(bkey)
-    except Exception:
-        st = {"exists": False, "active": False}
-
-    if not st.get("exists"):
+    def _get(r, k, i):
         try:
-            ensure_trial(bkey)
+            return r[k]
         except Exception:
-            # mantém idempotência mesmo se o serviço falhar; status é lido abaixo
-            pass
+            return r[i]
 
-    st = _safe_get_status(bkey)
-    return {"ok": True, "billing_key": bkey, "status": st}
+    return {
+        "trial_started_at": _get(row, "trial_started_at", 0),
+        "trial_ends_at": _get(row, "trial_ends_at", 1),
+        "paid_until": _get(row, "paid_until", 2),
+        "plan": _get(row, "plan", 3),
+        "last_payment_status": _get(row, "last_payment_status", 4),
+    }
 
 
-@router.get("/status")
-async def billing_status(user=Depends(get_current_user)) -> Dict[str, Any]:
+def get_status(billing_key: str) -> Dict[str, Any]:
     """
-    Retorna o status atual do billing (active, days_left, trial_ends_at, paid_until, plan...).
-    Admin (bypass): sempre ativo.
+    Retorna o status atual de billing, incluindo flags de ativo, dias restantes e se requer pagamento.
+
+    REGRAS:
+      - Vitalício: last_payment_status='paid' e paid_until IS NULL  -> active=True, plan='vitalicio', days_left=None.
+      - Pago com data: paid_until > now().
+      - Trial ativo:  trial_ends_at > now().
+      - Caso contrário: inactive.
     """
-    if _is_admin_bypass(user):
+    bkey = canonical_instance_key(billing_key)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trial_started_at, trial_ends_at, paid_until, plan, last_payment_status
+                  FROM billing_accounts
+                 WHERE billing_key = %s
+                """,
+                (bkey,),
+            )
+            row = cur.fetchone()
+
+    if not row:
         return {
-            "ok": True,
-            "billing_key": None,
-            "status": {"active": True, "plan": "admin", "admin_bypass": True},
+            "exists": False,
+            "active": False,
+            "trial_started_at": None,
+            "trial_ends_at": None,
+            "paid_until": None,
+            "days_left": 0,
+            "plan": None,
+            "last_payment_status": None,
+            "require_payment": False,
         }
 
-    bkey = _billing_key_from_user(user)
-    st = _safe_get_status(bkey)
-    return {"ok": True, "billing_key": bkey, "status": st}
+    def _get(r, k, i):
+        try:
+            return r[k]
+        except Exception:
+            return r[i]
 
-# Observação: cobranca via Stripe → ver routes/pay_stripe.py
+    trial_started = _get(row, "trial_started_at", 0)
+    trial_ends    = _get(row, "trial_ends_at", 1)
+    paid_until    = _get(row, "paid_until", 2)
+    plan          = _get(row, "plan", 3)
+    last_status   = (_get(row, "last_payment_status", 4) or "").lower()
+
+    now = _utcnow()
+
+    vitalicio    = (last_status == "paid" and paid_until is None)
+    trial_active = bool(trial_ends and trial_ends > now)
+    paid_active  = vitalicio or bool(paid_until and paid_until > now)
+    active       = bool(trial_active or paid_active)
+
+    if vitalicio:
+        days_left = None  # infinito
+        plan = plan or "vitalicio"
+    elif paid_until and paid_until > now:
+        days_left = max(0, (paid_until - now).days)
+        plan = plan or "pago"
+    elif trial_active:
+        days_left = max(0, (trial_ends - now).days)
+        plan = plan or "Trial"
+    else:
+        days_left = 0
+        plan = plan or "free"
+
+    return {
+        "exists": True,
+        "active": active,
+        "trial_started_at": trial_started,
+        "trial_ends_at": trial_ends,
+        "paid_until": paid_until,
+        "days_left": days_left,
+        "plan": plan,
+        "last_payment_status": last_status,
+        "require_payment": not active and bool(trial_started),
+        "vitalicio": vitalicio,
+    }
+
+
+def mark_paid(
+    billing_key: str,
+    days: int = 30,
+    plan: Optional[str] = None,
+    status: str = "paid",
+) -> None:
+    """
+    Avança/define paid_until por N dias a partir do maior entre agora e o paid_until atual.
+    Atualiza também plan e last_payment_status.
+    """
+    bkey = canonical_instance_key(billing_key)
+    now = _utcnow()
+    add_days = max(1, int(days))
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # garante existência do registro (idempotente)
+            cur.execute(
+                """
+                INSERT INTO billing_accounts (billing_key, created_at, trial_started_at, trial_ends_at)
+                VALUES (%s, NOW(), NOW(), %s)
+                ON CONFLICT (billing_key) DO NOTHING
+                """,
+                (bkey, now + timedelta(days=TRIAL_DAYS)),
+            )
+
+            cur.execute(
+                "SELECT paid_until FROM billing_accounts WHERE billing_key = %s",
+                (bkey,),
+            )
+            row = cur.fetchone()
+            paid_atual = None
+            if row is not None:
+                try:
+                    paid_atual = row["paid_until"]
+                except Exception:
+                    paid_atual = row[0]
+
+            base = paid_atual if (paid_atual and paid_atual > now) else now
+            new_paid = base + timedelta(days=add_days)
+
+            cur.execute(
+                """
+                UPDATE billing_accounts
+                   SET paid_until = %s,
+                       plan = COALESCE(%s, plan),
+                       last_payment_status = %s
+                 WHERE billing_key = %s
+                """,
+                (new_paid, plan, status, bkey),
+            )
+
+
+def mark_status(
+    billing_key: str,
+    status: str,
+    plan: Optional[str] = None,
+) -> None:
+    """
+    Atualiza apenas o last_payment_status (e opcionalmente o plan), sem mexer no paid_until.
+    Útil para refletir 'failed', 'canceled' etc. em /billing/status.
+    """
+    bkey = canonical_instance_key(billing_key)
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            # garante existência do registro (idempotente)
+            cur.execute(
+                """
+                INSERT INTO billing_accounts (billing_key, created_at, trial_started_at, trial_ends_at)
+                VALUES (%s, NOW(), NOW(), %s)
+                ON CONFLICT (billing_key) DO NOTHING
+                """,
+                (bkey, _utcnow() + timedelta(days=TRIAL_DAYS)),
+            )
+            cur.execute(
+                """
+                UPDATE billing_accounts
+                   SET last_payment_status = %s,
+                       plan = COALESCE(%s, plan)
+                 WHERE billing_key = %s
+                """,
+                (status, plan, bkey),
+            )
