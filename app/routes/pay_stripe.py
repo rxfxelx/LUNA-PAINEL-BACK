@@ -117,8 +117,11 @@ async def create_checkout(body: CheckoutIn) -> CheckoutOut:
 
     # Referência interna
     ref = f"st_{uuid.uuid4().hex}"
-    # ⚠️ IMPORTANTÍSSIMO: o tenant_key que sai do front precisa ser o mesmo billing_key
-    tenant_key = body.tenant_key or str(body.email)
+
+    # ⚠️ AGORA É OBRIGATÓRIO: uso EXCLUSIVO do token da instância
+    tenant_key = (body.tenant_key or "").strip()
+    if not tenant_key:
+        raise HTTPException(status_code=400, detail="Token da instância (tenant_key) é obrigatório.")
 
     # 1) cria/atualiza registro local "pending" (não bloqueia o fluxo)
     try:
