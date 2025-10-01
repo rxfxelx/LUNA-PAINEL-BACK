@@ -1,4 +1,3 @@
-# app/services/billing.py
 from __future__ import annotations
 
 import hashlib
@@ -18,22 +17,47 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# -------------------------------------------------------------------
+# CANONICALIZAÇÃO DE CHAVE (sempre por INSTÂNCIA)
+# -------------------------------------------------------------------
+def canonical_instance_key(key_or_token: str) -> str:
+    """
+    Normaliza qualquer identificador de instância para o formato:
+      iid:<valor>
+    - Se já vier com prefixo iid:, mantém.
+    - Caso contrário, pré-fixa iid: ao token/id informado.
+    """
+    s = (key_or_token or "").strip()
+    return s if s.startswith("iid:") else f"iid:{s}"
+
+
 def make_billing_key(token: str, host: str, instance_id: Optional[str]) -> str:
     """
-    Preferimos instance_id (UUID). Se não houver, usamos hash estável de host+token.
+    Preferimos billing por INSTÂNCIA:
+      - Se houver instance_id (UUID), usa:   iid:<instance_id>
+      - Senão, se houver token, usa:         iid:<token>
+      - Fallback legado (raríssimo): hash de host|token (ht:<sha256>)
     """
     if instance_id:
-        return f"iid:{instance_id}"
+        return canonical_instance_key(instance_id)
+    if token:
+        return canonical_instance_key(token)
+
+    # Fallback ultra-conservador (evitar None/None)
     raw = f"{host}|{token}".encode()
     digest = hmac.new(_SALT, raw, hashlib.sha256).hexdigest()
     return f"ht:{digest}"
 
 
+# -------------------------------------------------------------------
+# OPERACOES DE TRIAL / STATUS / ATUALIZACOES
+# -------------------------------------------------------------------
 def ensure_trial(billing_key: str) -> Dict[str, Any]:
     """
     Garante que exista um registro e que o trial esteja iniciado (idempotente).
     Retorna um snapshot básico do registro.
     """
+    bkey = canonical_instance_key(billing_key)
     trial_ends = _utcnow() + timedelta(days=TRIAL_DAYS)
 
     with get_pool().connection() as conn:
@@ -47,7 +71,7 @@ def ensure_trial(billing_key: str) -> Dict[str, Any]:
                     (%s, NOW(), NOW(), %s)
                 ON CONFLICT (billing_key) DO NOTHING
                 """,
-                (billing_key, trial_ends),
+                (bkey, trial_ends),
             )
 
             # Lê o registro atualizado
@@ -57,7 +81,7 @@ def ensure_trial(billing_key: str) -> Dict[str, Any]:
                   FROM billing_accounts
                  WHERE billing_key = %s
                 """,
-                (billing_key,),
+                (bkey,),
             )
             row = cur.fetchone()
 
@@ -70,7 +94,6 @@ def ensure_trial(billing_key: str) -> Dict[str, Any]:
             "last_payment_status": None,
         }
 
-    # dict_row permite acesso por chave; mantém compat se vier tupla
     def _get(r, k, i):
         try:
             return r[k]
@@ -89,7 +112,15 @@ def ensure_trial(billing_key: str) -> Dict[str, Any]:
 def get_status(billing_key: str) -> Dict[str, Any]:
     """
     Retorna o status atual de billing, incluindo flags de ativo, dias restantes e se requer pagamento.
+
+    REGRAS:
+      - Vitalício: last_payment_status='paid' e paid_until IS NULL  -> active=True, plan='vitalicio', days_left=None.
+      - Pago com data: paid_until > now().
+      - Trial ativo:  trial_ends_at > now().
+      - Caso contrário: inactive.
     """
+    bkey = canonical_instance_key(billing_key)
+
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -98,7 +129,7 @@ def get_status(billing_key: str) -> Dict[str, Any]:
                   FROM billing_accounts
                  WHERE billing_key = %s
                 """,
-                (billing_key,),
+                (bkey,),
             )
             row = cur.fetchone()
 
@@ -125,18 +156,27 @@ def get_status(billing_key: str) -> Dict[str, Any]:
     trial_ends    = _get(row, "trial_ends_at", 1)
     paid_until    = _get(row, "paid_until", 2)
     plan          = _get(row, "plan", 3)
-    last_status   = _get(row, "last_payment_status", 4)
+    last_status   = (_get(row, "last_payment_status", 4) or "").lower()
 
     now = _utcnow()
-    active = False
-    days_left = 0
 
-    if paid_until and paid_until > now:
-        active = True
+    vitalicio    = (last_status == "paid" and paid_until is None)
+    trial_active = bool(trial_ends and trial_ends > now)
+    paid_active  = vitalicio or bool(paid_until and paid_until > now)
+    active       = bool(trial_active or paid_active)
+
+    if vitalicio:
+        days_left = None  # infinito
+        plan = plan or "vitalicio"
+    elif paid_until and paid_until > now:
         days_left = max(0, (paid_until - now).days)
-    elif trial_ends and trial_ends > now:
-        active = True
+        plan = plan or "pago"
+    elif trial_active:
         days_left = max(0, (trial_ends - now).days)
+        plan = plan or "Trial"
+    else:
+        days_left = 0
+        plan = plan or "free"
 
     return {
         "exists": True,
@@ -147,7 +187,8 @@ def get_status(billing_key: str) -> Dict[str, Any]:
         "days_left": days_left,
         "plan": plan,
         "last_payment_status": last_status,
-        "require_payment": (not active) and bool(trial_started),
+        "require_payment": not active and bool(trial_started),
+        "vitalicio": vitalicio,
     }
 
 
@@ -161,6 +202,7 @@ def mark_paid(
     Avança/define paid_until por N dias a partir do maior entre agora e o paid_until atual.
     Atualiza também plan e last_payment_status.
     """
+    bkey = canonical_instance_key(billing_key)
     now = _utcnow()
     add_days = max(1, int(days))
 
@@ -173,12 +215,12 @@ def mark_paid(
                 VALUES (%s, NOW(), NOW(), %s)
                 ON CONFLICT (billing_key) DO NOTHING
                 """,
-                (billing_key, now + timedelta(days=TRIAL_DAYS)),
+                (bkey, now + timedelta(days=TRIAL_DAYS)),
             )
 
             cur.execute(
                 "SELECT paid_until FROM billing_accounts WHERE billing_key = %s",
-                (billing_key,),
+                (bkey,),
             )
             row = cur.fetchone()
             paid_atual = None
@@ -199,7 +241,7 @@ def mark_paid(
                        last_payment_status = %s
                  WHERE billing_key = %s
                 """,
-                (new_paid, plan, status, billing_key),
+                (new_paid, plan, status, bkey),
             )
 
 
@@ -212,6 +254,8 @@ def mark_status(
     Atualiza apenas o last_payment_status (e opcionalmente o plan), sem mexer no paid_until.
     Útil para refletir 'failed', 'canceled' etc. em /billing/status.
     """
+    bkey = canonical_instance_key(billing_key)
+
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             # garante existência do registro (idempotente)
@@ -221,7 +265,7 @@ def mark_status(
                 VALUES (%s, NOW(), NOW(), %s)
                 ON CONFLICT (billing_key) DO NOTHING
                 """,
-                (billing_key, _utcnow() + timedelta(days=TRIAL_DAYS)),
+                (bkey, _utcnow() + timedelta(days=TRIAL_DAYS)),
             )
             cur.execute(
                 """
@@ -230,5 +274,5 @@ def mark_status(
                        plan = COALESCE(%s, plan)
                  WHERE billing_key = %s
                 """,
-                (status, plan, billing_key),
+                (status, plan, bkey),
             )
